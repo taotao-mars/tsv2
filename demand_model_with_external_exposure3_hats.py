@@ -5178,6 +5178,10 @@ def run_attention_exposure3_in_old_decoder_style(
         remove_oos_dp=remove_oos_dp,
     )
 
+
+# Preserve original loader before adding external exposure-3 context.
+_ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3 = load_real_data
+
 # ============================================================
 # EXTERNAL / CALIBRATED EXPOSURE-3 HAT VERSION
 # ============================================================
@@ -5201,35 +5205,30 @@ def run_attention_exposure3_in_old_decoder_style(
 # ============================================================
 
 
+
 def _extract_external_exposure3_hat(result_or_hat):
     """
-    Extract a dataframe containing external predicted exposure hats.
+    Extract a clean dataframe containing external predicted exposure hats.
 
-    Accepted inputs:
-      A. calib_result dict:
-          calib_result["exposure_hat_for_demand_calib"]
+    This version is duplicate-column safe.
 
-      B. result dict:
-          result["exposure_hat_for_demand"]
-
-      C. nested result dict:
-          result["result_focus"]["exposure_hat_for_demand"]
-
-      D. direct dataframe with columns:
-          asin, order_week,
-          pred_total_dph,
-          pred_buy_box_dph,
-          pred_instock_dph OR pred_in_stock_dph
-
-      E. dataframe with calibrated columns:
-          pred_total_dph_calib,
-          pred_buy_box_dph_calib,
-          pred_in_stock_dph_calib
-
-      F. dataframe with only log columns:
-          external_total_dph_hat_log,
-          external_buy_box_dph_hat_log,
-          external_instock_dph_hat_log
+    Priority:
+      1. calibrated level columns:
+           pred_total_dph_calib
+           pred_buy_box_dph_calib
+           pred_in_stock_dph_calib / pred_instock_dph_calib
+      2. normal level columns:
+           pred_total_dph
+           pred_buy_box_dph
+           pred_instock_dph / pred_in_stock_dph
+      3. attention level columns:
+           attn_total_dph
+           attn_buy_box_dph
+           attn_instock_dph / attn_in_stock_dph
+      4. log columns:
+           external_total_dph_hat_log
+           external_buy_box_dph_hat_log
+           external_instock_dph_hat_log
     """
     source = None
 
@@ -5272,70 +5271,93 @@ def _extract_external_exposure3_hat(result_or_hat):
 
     hat = hat.copy()
 
-    # ------------------------------------------------------------
-    # Standardize column names.
-    # ------------------------------------------------------------
-    rename_map = {}
+    if "asin" not in hat.columns or "order_week" not in hat.columns:
+        raise ValueError("External exposure hat must contain asin and order_week.")
 
-    # Calibrated column names.
-    if "pred_total_dph_calib" in hat.columns:
-        rename_map["pred_total_dph_calib"] = "pred_total_dph"
-    if "pred_buy_box_dph_calib" in hat.columns:
-        rename_map["pred_buy_box_dph_calib"] = "pred_buy_box_dph"
-    if "pred_in_stock_dph_calib" in hat.columns:
-        rename_map["pred_in_stock_dph_calib"] = "pred_instock_dph"
-    if "pred_instock_dph_calib" in hat.columns:
-        rename_map["pred_instock_dph_calib"] = "pred_instock_dph"
+    def _first_existing_col(df, cols):
+        for c in cols:
+            if c in df.columns:
+                x = df[c]
+                # If duplicate column names still exist for any reason, take the first one.
+                if isinstance(x, pd.DataFrame):
+                    x = x.iloc[:, 0]
+                return x, c
+        return None, None
 
-    # Best attention output names.
-    if "attn_total_dph" in hat.columns and "pred_total_dph" not in hat.columns:
-        rename_map["attn_total_dph"] = "pred_total_dph"
-    if "attn_buy_box_dph" in hat.columns and "pred_buy_box_dph" not in hat.columns:
-        rename_map["attn_buy_box_dph"] = "pred_buy_box_dph"
-    if "attn_instock_dph" in hat.columns and "pred_instock_dph" not in hat.columns:
-        rename_map["attn_instock_dph"] = "pred_instock_dph"
-    if "attn_in_stock_dph" in hat.columns and "pred_instock_dph" not in hat.columns:
-        rename_map["attn_in_stock_dph"] = "pred_instock_dph"
+    total_s, total_src = _first_existing_col(
+        hat,
+        [
+            "pred_total_dph_calib",
+            "pred_total_dph",
+            "attn_total_dph",
+            "external_total_dph_hat_log",
+        ],
+    )
 
-    # Alternate instock spelling.
-    if "pred_in_stock_dph" in hat.columns and "pred_instock_dph" not in hat.columns:
-        rename_map["pred_in_stock_dph"] = "pred_instock_dph"
+    buy_s, buy_src = _first_existing_col(
+        hat,
+        [
+            "pred_buy_box_dph_calib",
+            "pred_buy_box_dph",
+            "attn_buy_box_dph",
+            "external_buy_box_dph_hat_log",
+        ],
+    )
 
-    if rename_map:
-        hat = hat.rename(columns=rename_map)
+    instock_s, instock_src = _first_existing_col(
+        hat,
+        [
+            "pred_in_stock_dph_calib",
+            "pred_instock_dph_calib",
+            "pred_instock_dph",
+            "pred_in_stock_dph",
+            "attn_instock_dph",
+            "attn_in_stock_dph",
+            "external_instock_dph_hat_log",
+        ],
+    )
 
-    # If level columns are not available but log columns exist, recover levels.
-    if "pred_total_dph" not in hat.columns and "external_total_dph_hat_log" in hat.columns:
-        hat["pred_total_dph"] = np.expm1(pd.to_numeric(hat["external_total_dph_hat_log"], errors="coerce").fillna(0.0))
-    if "pred_buy_box_dph" not in hat.columns and "external_buy_box_dph_hat_log" in hat.columns:
-        hat["pred_buy_box_dph"] = np.expm1(pd.to_numeric(hat["external_buy_box_dph_hat_log"], errors="coerce").fillna(0.0))
-    if "pred_instock_dph" not in hat.columns and "external_instock_dph_hat_log" in hat.columns:
-        hat["pred_instock_dph"] = np.expm1(pd.to_numeric(hat["external_instock_dph_hat_log"], errors="coerce").fillna(0.0))
+    missing = []
+    if total_s is None:
+        missing.append("pred_total_dph")
+    if buy_s is None:
+        missing.append("pred_buy_box_dph")
+    if instock_s is None:
+        missing.append("pred_instock_dph")
 
-    required = [
-        "asin",
-        "order_week",
-        "pred_total_dph",
-        "pred_buy_box_dph",
-        "pred_instock_dph",
-    ]
-    missing = [c for c in required if c not in hat.columns]
     if missing:
         raise ValueError(
-            "External exposure hat is missing required columns: "
+            "External exposure hat is missing required prediction columns: "
             f"{missing}. Available columns: {hat.columns.tolist()}"
         )
 
-    hat = hat[required].copy()
-    hat["asin"] = hat["asin"].astype(str)
-    hat["order_week"] = pd.to_datetime(hat["order_week"])
+    clean = pd.DataFrame({
+        "asin": hat["asin"].astype(str),
+        "order_week": pd.to_datetime(hat["order_week"]),
+    })
+
+    # If source is log column, convert back to level.
+    if total_src == "external_total_dph_hat_log":
+        clean["pred_total_dph"] = np.expm1(pd.to_numeric(total_s, errors="coerce").fillna(0.0))
+    else:
+        clean["pred_total_dph"] = pd.to_numeric(total_s, errors="coerce").fillna(0.0)
+
+    if buy_src == "external_buy_box_dph_hat_log":
+        clean["pred_buy_box_dph"] = np.expm1(pd.to_numeric(buy_s, errors="coerce").fillna(0.0))
+    else:
+        clean["pred_buy_box_dph"] = pd.to_numeric(buy_s, errors="coerce").fillna(0.0)
+
+    if instock_src == "external_instock_dph_hat_log":
+        clean["pred_instock_dph"] = np.expm1(pd.to_numeric(instock_s, errors="coerce").fillna(0.0))
+    else:
+        clean["pred_instock_dph"] = pd.to_numeric(instock_s, errors="coerce").fillna(0.0)
 
     for c in ["pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]:
-        hat[c] = pd.to_numeric(hat[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+        clean[c] = clean[c].fillna(0.0).clip(lower=0.0)
 
     # Safety: one ASIN-week row.
-    hat = (
-        hat.groupby(["asin", "order_week"], as_index=False)
+    clean = (
+        clean.groupby(["asin", "order_week"], as_index=False)
         .agg(
             pred_total_dph=("pred_total_dph", "mean"),
             pred_buy_box_dph=("pred_buy_box_dph", "mean"),
@@ -5343,7 +5365,12 @@ def _extract_external_exposure3_hat(result_or_hat):
         )
     )
 
-    return hat, source
+    print("\nExternal exposure hat source:", source)
+    print("Selected total column:", total_src)
+    print("Selected buy_box column:", buy_src)
+    print("Selected instock column:", instock_src)
+
+    return clean, source
 
 
 def attach_external_exposure3_to_raw_data(
@@ -5487,6 +5514,94 @@ def run_external_exposure3_in_old_decoder_style(
         remove_oos_dp=remove_oos_dp,
     )
 
+
+
+def load_real_data(data_raw, dph_cap_q=0.995):
+    """
+    Override original load_real_data to inject external exposure-3 hats into future_context.
+
+    Added future context columns:
+      external_total_dph_hat_log
+      external_buy_box_dph_hat_log
+      external_instock_dph_hat_log
+
+    These are predicted future covariates, not true future DPH.
+    """
+    data, context_dim, context_cols = _ORIGINAL_LOAD_REAL_DATA_BEFORE_EXTERNAL_EXP3(
+        data_raw=data_raw,
+        dph_cap_q=dph_cap_q,
+    )
+
+    required = [
+        "asin",
+        "order_week",
+        "attn_pred_total_log",
+        "attn_pred_buy_box_log",
+        "attn_pred_instock_log",
+    ]
+
+    if not all(c in data_raw.columns for c in required):
+        print("\nExternal exposure-3 columns not found. Using original future_context.")
+        return data, context_dim, context_cols
+
+    ext = data_raw[required].copy()
+    ext["asin"] = ext["asin"].astype(str)
+    ext["order_week"] = pd.to_datetime(ext["order_week"])
+
+    for c in ["attn_pred_total_log", "attn_pred_buy_box_log", "attn_pred_instock_log"]:
+        ext[c] = pd.to_numeric(ext[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    ext = (
+        ext.sort_values(["asin", "order_week"])
+        .groupby(["asin", "order_week"], as_index=False)
+        .agg(
+            attn_pred_total_log=("attn_pred_total_log", "mean"),
+            attn_pred_buy_box_log=("attn_pred_buy_box_log", "mean"),
+            attn_pred_instock_log=("attn_pred_instock_log", "mean"),
+        )
+    )
+
+    new_cols = [
+        "external_total_dph_hat_log",
+        "external_buy_box_dph_hat_log",
+        "external_instock_dph_hat_log",
+    ]
+
+    added_any = False
+
+    for asin, d in data.items():
+        sub = ext[ext["asin"] == str(asin)].sort_values("order_week")
+
+        if len(sub) != len(d["week"]):
+            # Align by week to be safe.
+            week_df = pd.DataFrame({"order_week": pd.to_datetime(d["week"])})
+            sub = week_df.merge(
+                sub.drop(columns=["asin"]),
+                on="order_week",
+                how="left",
+            )
+
+        arr = sub[[
+            "attn_pred_total_log",
+            "attn_pred_buy_box_log",
+            "attn_pred_instock_log",
+        ]].fillna(0.0).values.astype(np.float32)
+
+        old_fc = d["future_context"]
+        d["future_context"] = np.concatenate([old_fc, arr], axis=1)
+        added_any = True
+
+    if added_any:
+        context_cols = context_cols + new_cols
+        context_dim = len(context_cols)
+
+        print("\n" + "=" * 100)
+        print("EXTERNAL EXPOSURE-3 HATS ADDED TO FUTURE_CONTEXT")
+        print("=" * 100)
+        print("Added context cols:", new_cols)
+        print("New context dim:", context_dim)
+
+    return data, context_dim, context_cols
 
 # ============================================================
 # USAGE
