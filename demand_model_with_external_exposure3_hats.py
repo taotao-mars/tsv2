@@ -5376,9 +5376,30 @@ def _extract_external_exposure3_hat(result_or_hat):
 def attach_external_exposure3_to_raw_data(
     data_raw1,
     exposure3_hat,
+    exposure_mode="all3",
 ):
     """
     Attach external predicted exposure funnel to data_raw1.
+
+    exposure_mode:
+      "all3":
+          use total + buy_box + instock hats
+
+      "instock_only":
+          use only instock hat; total/buybox hats are set to 0
+          so demand model only receives external_instock_dph_hat_log.
+
+      "total_only":
+          use only total hat
+
+      "buybox_only":
+          use only buy_box hat
+
+      "total_instock":
+          use total + instock hats
+
+      "buybox_instock":
+          use buy_box + instock hats
 
     Output columns:
       attn_pred_total_dph
@@ -5387,7 +5408,30 @@ def attach_external_exposure3_to_raw_data(
 
     These columns are then picked up by the overridden load_real_data and DemandDataset.
     """
+    valid_modes = {
+        "all3",
+        "instock_only",
+        "total_only",
+        "buybox_only",
+        "total_instock",
+        "buybox_instock",
+    }
+    if exposure_mode not in valid_modes:
+        raise ValueError(f"exposure_mode must be one of {sorted(valid_modes)}, got {exposure_mode}")
+
     hat, source = _extract_external_exposure3_hat(exposure3_hat)
+
+    # Select which external hats are allowed to enter demand model.
+    use_total = exposure_mode in {"all3", "total_only", "total_instock"}
+    use_buy = exposure_mode in {"all3", "buybox_only", "buybox_instock"}
+    use_instock = exposure_mode in {"all3", "instock_only", "total_instock", "buybox_instock"}
+
+    if not use_total:
+        hat["pred_total_dph"] = 0.0
+    if not use_buy:
+        hat["pred_buy_box_dph"] = 0.0
+    if not use_instock:
+        hat["pred_instock_dph"] = 0.0
 
     df = data_raw1.copy()
     df["asin"] = df["asin"].astype(str)
@@ -5417,16 +5461,24 @@ def attach_external_exposure3_to_raw_data(
     out["attn_pred_instock_log"] = np.log1p(out["attn_pred_instock_dph"])
 
     print("\n" + "=" * 100)
-    print("EXTERNAL EXPOSURE-3 HATS ATTACHED TO DEMAND DATA")
+    print("EXTERNAL EXPOSURE HATS ATTACHED TO DEMAND DATA")
     print("=" * 100)
     print("Source:", source)
-    print("Demand model will receive:")
-    print("  log1p(attn_pred_total_dph)")
-    print("  log1p(attn_pred_buy_box_dph)")
-    print("  log1p(attn_pred_instock_dph)")
+    print("exposure_mode:", exposure_mode)
+    print("Using total hat:", use_total)
+    print("Using buy_box hat:", use_buy)
+    print("Using instock hat:", use_instock)
+
+    print("\nDemand model receives:")
+    if use_total:
+        print("  log1p(attn_pred_total_dph)")
+    if use_buy:
+        print("  log1p(attn_pred_buy_box_dph)")
+    if use_instock:
+        print("  log1p(attn_pred_instock_dph)")
     print("No true future exposure is used as input.")
 
-    print("\nHat summaries:")
+    print("\nHat summaries after mode selection:")
     print(
         out[
             [
@@ -5444,6 +5496,7 @@ def run_external_exposure3_in_old_decoder_style(
     data_raw1,
     scot_df,
     exposure3_hat,
+    exposure_mode="all3",
     n_asins=5000,
     seed=42,
     zero_thresholds=(0.4, 0.7),
@@ -5479,12 +5532,14 @@ def run_external_exposure3_in_old_decoder_style(
     This function injects the three hats into the demand model's future context.
     """
     print("\n" + "=" * 100)
-    print("DEMAND MODEL WITH EXTERNAL EXPOSURE-3 HATS")
+    print("DEMAND MODEL WITH EXTERNAL EXPOSURE HATS")
     print("=" * 100)
+    print("exposure_mode:", exposure_mode)
 
     data_with_external_exp3 = attach_external_exposure3_to_raw_data(
         data_raw1=data_raw1,
         exposure3_hat=exposure3_hat,
+        exposure_mode=exposure_mode,
     )
 
     return run_nb_all_sample_scot_intersection(
@@ -5603,23 +5658,65 @@ def load_real_data(data_raw, dph_cap_q=0.995):
 
     return data, context_dim, context_cols
 
+
 # ============================================================
 # USAGE
 # ============================================================
-# Use the three DPH hats you already generated from exposure model:
-#   exposure_hat_for_demand_calib
+# Choose which external DPH hats to feed into the demand model.
 #
-# This can be:
-#   calib_result["exposure_hat_for_demand_calib"]
-#   result_e2e_attn["exposure_hat_for_demand"]
-#   result_best["exposure_hat_for_demand"]
-#   or a dataframe with pred_total_dph / pred_buy_box_dph / pred_instock_dph.
+# exposure_mode options:
+#   "instock_only"     -> only use pred_instock_dph
+#   "all3"            -> use pred_total_dph + pred_buy_box_dph + pred_instock_dph
+#   "total_only"
+#   "buybox_only"
+#   "total_instock"
+#   "buybox_instock"
+#
+# Recommended:
+#   First run "instock_only".
+#   Then run "all3".
+#   Compare final WAPE.
 # ============================================================
 
-result_external_exp3_demand = run_external_exposure3_in_old_decoder_style(
+# ------------------------------------------------------------
+# Version A: only in-stock hat
+# ------------------------------------------------------------
+result_external_instock_only = run_external_exposure3_in_old_decoder_style(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    exposure3_hat=exposure_hat_for_demand_calib,  # <-- your new three DPH hats
+    exposure3_hat=exposure_hat_for_demand_calib,
+    exposure_mode="instock_only",
+    n_asins=5000,
+    seed=42,
+    zero_thresholds=(0.4, 0.7),
+    prior_scale=0.3,
+    epochs=60,
+    history=52,
+    horizon=20,
+    d_model=32,
+    d_z=16,
+    batch_size=64,
+    M_eval=100,
+    lambda_q=0.05,
+    beta_tail=0.5,
+    patience=5,
+    lambda_z_reg=1.0,
+    lambda_stock=0.0,
+    lambda_stock_mean_weight=0.0,
+    remove_extreme=True,
+    extreme_q=0.99,
+    run_wape=True,
+    remove_oos_dp=True,
+)
+
+# ------------------------------------------------------------
+# Version B: all three hats
+# ------------------------------------------------------------
+result_external_all3 = run_external_exposure3_in_old_decoder_style(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    exposure3_hat=exposure_hat_for_demand_calib,
+    exposure_mode="all3",
     n_asins=5000,
     seed=42,
     zero_thresholds=(0.4, 0.7),
