@@ -4460,12 +4460,63 @@ def run_posthoc_calibration_on_best_anchor_attention(
 # exposure_hat_for_demand_calib = calib_result["exposure_hat_for_demand_calib"]
 #
 
+
+
+
+# ============================================================
+# Helper: get raw best-attention exposure hat without calibration
+# ============================================================
+
+def get_best_attention_hat_without_calibration(result_best):
+    """
+    Return raw best anchor-attention exposure hat for demand model.
+
+    This intentionally does NOT apply:
+      - global calibration
+      - event calibration
+      - high exposure calibration
+      - funnel post calibration
+
+    Returns columns:
+      asin
+      order_week
+      pred_total_dph
+      pred_buy_box_dph
+      pred_instock_dph
+    """
+    if "exposure_hat_for_demand" not in result_best:
+        raise ValueError("result_best must contain result_best['exposure_hat_for_demand'].")
+
+    hat = result_best["exposure_hat_for_demand"].copy()
+
+    required = ["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]
+    missing = [c for c in required if c not in hat.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in raw best attention hat: {missing}")
+
+    return hat
+
+
 # ============================================================
 # USAGE
 # ============================================================
-# This version adds explicit event features into future_context, then applies:
-#   global + event + high exposure calibration
-#   funnel constraint: total >= buy_box >= in_stock
+# Best attention version WITHOUT post-hoc calibration.
+#
+# This keeps:
+#   1. explicit event features in future_context
+#   2. base exposure model
+#   3. anchor attention blender
+#
+# This removes:
+#   1. global/event/high post calibration
+#   2. funnel post calibration
+#
+# Output for demand model:
+#   exposure_hat_for_demand
+#
+# Compatibility alias:
+#   exposure_hat_for_demand_calib = exposure_hat_for_demand
+# so your existing demand-model code can still run without changing the name.
 # ============================================================
 
 result_best = run_best_exposure_anchor_attention(
@@ -4477,19 +4528,37 @@ result_best = run_best_exposure_anchor_attention(
     horizon=20,
     d_model=64,
     batch_size=64,
-    epochs=60,
-    lr=1e-3,
-    patience=8,
+    exposure_epochs=60,
+    exposure_lr=1e-3,
+    exposure_patience=8,
+    attn_epochs=80,
+    attn_batch_size=1024,
+    attn_lr=1e-3,
+    attn_patience=10,
+    attn_hidden=64,
+    attn_dropout=0.10,
 )
 
-calib_result = run_posthoc_calibration_on_best_anchor_attention(
-    result_best=result_best,
-    data_raw1=data_raw1,
-    mode="upper_bound",
-    event_window_weeks=2,
-    high_q=0.80,
-    clip_scale=(0.70, 1.80),
-    shrink_k=5000,
-)
+# Raw best anchor-attention hats.
+# Columns:
+#   pred_total_dph
+#   pred_buy_box_dph
+#   pred_instock_dph
+exposure_hat_for_demand = result_best["exposure_hat_for_demand"]
 
-exposure_hat_for_demand_calib = calib_result["exposure_hat_for_demand_calib"]
+# Compatibility alias.
+# This is NOT calibrated anymore; it is the raw best attention hat.
+# It lets old demand-model usage keep:
+#   exposure3_hat=exposure_hat_for_demand_calib
+exposure_hat_for_demand_calib = exposure_hat_for_demand
+
+print("\n" + "=" * 100)
+print("NO-CALIB EXPOSURE HAT READY")
+print("=" * 100)
+print("Using raw best anchor-attention output.")
+print("No post-hoc calibration applied.")
+print("Use either variable in demand model:")
+print("  exposure_hat_for_demand")
+print("  exposure_hat_for_demand_calib  # alias, not calibrated")
+print("\nColumns:")
+print(exposure_hat_for_demand.columns.tolist())
