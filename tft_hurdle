@@ -1,0 +1,652 @@
+# ============================================================
+# TFTStyleExposureModel with Hurdle Head
+#
+# 改动范围：只改 TFTStyleExposureModel 和 tft_exposure_loss
+# 其他所有代码（数据加载、Dataset、训练loop、评估）完全不变
+#
+# 核心改动：
+#   原来: head → softplus → log_hat [B,H,3]
+#   现在: active_head → sigmoid → p_active [B,H,3]   (occurrence)
+#         mag_head   → softplus → log_mag  [B,H,3]   (magnitude)
+#         log_hat    = p_active * log_mag              (gated output)
+#
+# output shape 完全不变: [B,H,3]
+#   [...,0] = total_dph_hat (log1p scale, gated)
+#   [...,1] = buy_box_dph_hat
+#   [...,2] = in_stock_dph_hat
+#
+# loss 改动：
+#   原来: huber(log_hat, target_log) + mean_penalty + under_penalty
+#   现在: BCE(p_active, active_label)
+#       + huber(log_mag, target_log) on active cells only
+#       + mean_penalty (不变)
+# ============================================================
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 复用原文件的 GRN 和 VariableSelectionNetwork（不改）
+# ============================================================
+
+class GRN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.10):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.gate = nn.Sequential(nn.Linear(hidden_dim, output_dim), nn.Sigmoid())
+        self.skip = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+        self.norm = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        z = F.elu(self.fc1(x))
+        z = self.dropout(z)
+        z = self.fc2(z)
+        gated = self.gate(z) * z
+        return self.norm(self.skip(x) + gated)
+
+
+class VariableSelectionNetwork(nn.Module):
+    def __init__(self, n_vars, d_model=64, hidden=64, dropout=0.10):
+        super().__init__()
+        self.n_vars = n_vars
+        self.d_model = d_model
+        self.var_proj = nn.ModuleList([nn.Linear(1, d_model) for _ in range(n_vars)])
+        self.weight_net = nn.Sequential(
+            nn.Linear(n_vars, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_vars),
+        )
+        self.post = GRN(d_model, hidden, d_model, dropout=dropout)
+
+    def forward(self, x):
+        B, T, Fdim = x.shape
+        if Fdim != self.n_vars:
+            raise ValueError(f"Expected {self.n_vars} variables, got {Fdim}")
+        embs = torch.stack(
+            [self.var_proj[j](x[:, :, j:j+1]) for j in range(self.n_vars)],
+            dim=-2,
+        )  # [B,T,F,D]
+        logits = self.weight_net(x)           # [B,T,F]
+        weights = torch.softmax(logits, dim=-1)
+        selected = torch.sum(embs * weights.unsqueeze(-1), dim=-2)  # [B,T,D]
+        selected = self.post(selected)
+        return selected, weights
+
+
+# ============================================================
+# TFTStyleExposureModel — Hurdle Head 版本
+# ============================================================
+
+class TFTStyleExposureModelHurdle(nn.Module):
+    """
+    与原 TFTStyleExposureModel 完全相同的结构，
+    只把最后的单一 head 换成 Hurdle 双头。
+
+    输入：
+        x              [B, T, input_dim]   历史特征（不变）
+        future_context [B, H, context_dim] 未来已知特征（不变）
+
+    输出：
+        log_hat        [B, H, 3]           与原模型完全相同的 shape/scale
+            [...,0] = total_dph   预测值（log1p-gated）
+            [...,1] = buy_box_dph
+            [...,2] = in_stock_dph
+
+    额外输出（return_aux=True 时）：
+        p_active   [B, H, 3]   三个 DPH 各自的 active 概率（0-1）
+        log_mag    [B, H, 3]   纯 magnitude 预测（未 gate）
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        context_dim,
+        d_model=64,
+        horizon=20,
+        n_heads=4,
+        dropout=0.10,
+    ):
+        super().__init__()
+        self.horizon = horizon
+        self.d_model = d_model
+
+        # ── Encoder 部分（完全不变）──────────────────────────
+        self.hist_vsn = VariableSelectionNetwork(
+            n_vars=input_dim,
+            d_model=d_model,
+            hidden=max(64, d_model),
+            dropout=dropout,
+        )
+
+        self.future_vsn = VariableSelectionNetwork(
+            n_vars=context_dim,
+            d_model=d_model,
+            hidden=max(64, d_model),
+            dropout=dropout,
+        )
+
+        self.encoder_lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=1,
+            batch_first=True,
+            dropout=0.0,
+        )
+
+        # ── Decoder 部分（完全不变）──────────────────────────
+        self.decoder_lstm = nn.LSTM(
+            input_size=d_model + 4,   # fut_sel + horizon_features
+            hidden_size=d_model,
+            num_layers=1,
+            batch_first=True,
+            dropout=0.0,
+        )
+
+        # Cross-attention: Q=decoder, K=V=encoder（不变）
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.post_attn = GRN(d_model, max(64, d_model), d_model, dropout=dropout)
+
+        # ── Hurdle Head（唯一改动）────────────────────────────
+        hidden = max(64, d_model)
+
+        # Head 1: occurrence — 这个 DPH 在这周 active 吗？
+        # 输出: [B,H,3]，sigmoid → p_active ∈ (0,1)
+        self.active_head = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 3),
+            # 不加 sigmoid，在 forward 里显式调用，方便 loss 用 BCEWithLogits
+        )
+
+        # Head 2: magnitude — 如果 active，DPH 值是多少？
+        # 输出: [B,H,3]，softplus → log_mag > 0
+        self.mag_head = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 3),
+        )
+
+    # ── horizon position features（不变）─────────────────────
+    def _horizon_features(self, B, H, device, dtype):
+        h = torch.arange(1, H + 1, device=device, dtype=dtype)
+        h_norm = h / max(float(H), 1.0)
+        feats = torch.stack([
+            h_norm,
+            torch.sin(2 * torch.pi * h_norm),
+            torch.cos(2 * torch.pi * h_norm),
+            (h >= 13).float(),
+        ], dim=-1)
+        return feats.view(1, H, 4).expand(B, H, 4)
+
+    def forward(self, x, future_context, return_aux=False):
+        # ── Encoder ──────────────────────────────────────────
+        hist_sel, hist_w = self.hist_vsn(x)
+        fut_sel, fut_w = self.future_vsn(future_context)
+
+        enc_out, (h_n, c_n) = self.encoder_lstm(hist_sel)
+        # enc_out: [B, T=52, d_model]
+
+        # ── Decoder ──────────────────────────────────────────
+        B, H, _ = future_context.shape
+        h_feat = self._horizon_features(B, H, future_context.device, future_context.dtype)
+
+        dec_in = torch.cat([fut_sel, h_feat], dim=-1)   # [B,H, d_model+4]
+        dec_out, _ = self.decoder_lstm(dec_in, (h_n, c_n))
+        # dec_out: [B, H=20, d_model]
+
+        # ── Cross-Attention（不变）────────────────────────────
+        # Q = decoder horizon states
+        # K = V = full encoder history
+        attn_out, attn_weights = self.attn(
+            dec_out,    # Q [B,H,D]
+            enc_out,    # K [B,T,D]
+            enc_out,    # V [B,T,D]
+            need_weights=True,
+        )
+
+        z = self.post_attn(dec_out + attn_out)   # [B,H,D]
+
+        # ── Hurdle Head ───────────────────────────────────────
+        # active_logit: raw logit，用于 BCEWithLogitsLoss（更稳定）
+        active_logit = self.active_head(z)                    # [B,H,3]
+        p_active = torch.sigmoid(active_logit)                # [B,H,3] ∈ (0,1)
+
+        # magnitude: softplus 保证 > 0
+        log_mag = F.softplus(self.mag_head(z))                # [B,H,3]
+
+        # 最终输出：occurrence × magnitude
+        # shape [B,H,3]，与原模型完全相同
+        # 当 p_active≈0 时输出趋近 0，当 p_active≈1 时输出≈log_mag
+        log_hat = p_active * log_mag                          # [B,H,3]
+
+        if return_aux:
+            return {
+                "log_hat": log_hat,
+                "p_active": p_active,          # 新增：active 概率
+                "active_logit": active_logit,  # 新增：用于 loss
+                "log_mag": log_mag,            # 新增：纯 magnitude
+                "hist_var_weights": hist_w,
+                "future_var_weights": fut_w,
+                "attn_weights": attn_weights,
+            }
+
+        return log_hat
+
+
+# ============================================================
+# tft_hurdle_loss
+# 替换原来的 tft_exposure_loss
+#
+# 签名和参数与原 tft_exposure_loss 完全兼容，
+# 只是 log_hat 现在是 gated output，需要额外传 active_logit 和 log_mag
+# ============================================================
+
+def tft_hurdle_loss(
+    log_hat,            # [B,H,3]  gated output（p_active * log_mag）
+    true_total,         # [B,H]
+    true_buy,           # [B,H]
+    true_instock,       # [B,H]
+    active_logit,       # [B,H,3]  raw logit for BCE（新增，从 return_aux 获取）
+    log_mag,            # [B,H,3]  pure magnitude（新增）
+    w_total=0.30,
+    w_buy=0.60,
+    w_instock=1.00,
+    bce_weight=1.00,    # BCE loss 权重
+    mag_weight=1.00,    # magnitude loss 权重
+    mean_weight=0.20,   # mean scale penalty 权重（不变）
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+):
+    # ── 整理 true ────────────────────────────────────────────
+    true = torch.stack([
+        true_total.clamp(min=0.0),
+        true_buy.clamp(min=0.0),
+        true_instock.clamp(min=0.0),
+    ], dim=-1)   # [B,H,3]
+
+    target_log = torch.log1p(true)   # [B,H,3]
+
+    target_weights = torch.tensor(
+        [w_total, w_buy, w_instock],
+        dtype=log_hat.dtype,
+        device=log_hat.device,
+    ).view(1, 1, 3)
+
+    # ── 辅助权重：高曝光行 + 长 horizon ──────────────────────
+    denom = target_log.detach().mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+    high_w = 1.0 + high_weight_alpha * target_log.detach() / denom
+
+    H = true.shape[1]
+    h = torch.arange(1, H + 1, device=true.device, dtype=true.dtype).view(1, H, 1)
+    horizon_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
+
+    sample_w = high_w * horizon_w   # [B,H,3]（不含 target_weights，下面分开乘）
+
+    # ── Loss 1: BCE（occurrence）─────────────────────────────
+    # 对三个 DPH 各自判断"这周 active 吗"
+    active_label = (true > 0).float()   # [B,H,3]
+
+    bce = F.binary_cross_entropy_with_logits(
+        active_logit,
+        active_label,
+        reduction="none",
+    )   # [B,H,3]
+
+    bce_loss = (bce * sample_w * target_weights).mean()
+
+    # ── Loss 2: Magnitude Huber（只在 active 周计算）─────────
+    active_mask = active_label   # [B,H,3]
+
+    mag_err = F.huber_loss(
+        log_mag,
+        target_log,
+        delta=1.0,
+        reduction="none",
+    )   # [B,H,3]
+
+    # 只在 true>0 的格子计算，分母用 active cell 数量避免偏移
+    mag_numerator = (mag_err * active_mask * sample_w * target_weights).sum()
+    mag_denominator = (active_mask * sample_w * target_weights).sum().clamp_min(1.0)
+    mag_loss = mag_numerator / mag_denominator
+
+    # ── Loss 3: Mean Scale Penalty（不变）────────────────────
+    pred_level = torch.expm1(log_hat).clamp(min=0.0)
+    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
+    mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
+    mean_loss = (torch.abs(mean_pred - mean_true) * target_weights.view(3)).mean()
+
+    # ── 合并 ─────────────────────────────────────────────────
+    total = (
+        bce_weight  * bce_loss
+        + mag_weight  * mag_loss
+        + mean_weight * mean_loss
+    )
+
+    return total
+
+
+# ============================================================
+# train_tft_hurdle_model
+# 只改了调用方式（需要 return_aux=True 获取 active_logit 和 log_mag）
+# 其他 loop 结构完全不变
+# ============================================================
+
+def train_tft_hurdle_model(
+    model,
+    tr_ld,
+    va_ld,
+    epochs=60,
+    lr=1e-3,
+    patience=8,
+    w_total=0.30,
+    w_buy=0.60,
+    w_instock=1.00,
+    bce_weight=1.00,
+    mag_weight=1.00,
+    mean_weight=0.20,
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+):
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+
+    best_val = float("inf")
+    best_sd = None
+    no_improve = 0
+
+    for epoch in range(epochs):
+        model.train()
+        tr_sum, tr_n = 0.0, 0
+
+        for b in tr_ld:
+            # return_aux=True 获取 hurdle 中间量
+            aux = model(b["x"], b["future_context"], return_aux=True)
+
+            loss = tft_hurdle_loss(
+                log_hat=aux["log_hat"],
+                true_total=b["future_total_dph"],
+                true_buy=b["future_buy_box_dph"],
+                true_instock=b["future_instock_dph"],
+                active_logit=aux["active_logit"],
+                log_mag=aux["log_mag"],
+                w_total=w_total,
+                w_buy=w_buy,
+                w_instock=w_instock,
+                bce_weight=bce_weight,
+                mag_weight=mag_weight,
+                mean_weight=mean_weight,
+                horizon_weight_alpha=horizon_weight_alpha,
+                high_weight_alpha=high_weight_alpha,
+            )
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            tr_sum += loss.item() * b["x"].shape[0]
+            tr_n += b["x"].shape[0]
+
+        sch.step()
+
+        model.eval()
+        va_sum, va_n = 0.0, 0
+
+        with torch.no_grad():
+            for b in va_ld:
+                aux = model(b["x"], b["future_context"], return_aux=True)
+
+                loss = tft_hurdle_loss(
+                    log_hat=aux["log_hat"],
+                    true_total=b["future_total_dph"],
+                    true_buy=b["future_buy_box_dph"],
+                    true_instock=b["future_instock_dph"],
+                    active_logit=aux["active_logit"],
+                    log_mag=aux["log_mag"],
+                    w_total=w_total,
+                    w_buy=w_buy,
+                    w_instock=w_instock,
+                    bce_weight=bce_weight,
+                    mag_weight=mag_weight,
+                    mean_weight=mean_weight,
+                    horizon_weight_alpha=horizon_weight_alpha,
+                    high_weight_alpha=high_weight_alpha,
+                )
+
+                va_sum += loss.item() * b["x"].shape[0]
+                va_n += b["x"].shape[0]
+
+        tr_loss = tr_sum / max(tr_n, 1)
+        va_loss = va_sum / max(va_n, 1)
+
+        print(f"[TFT-Hurdle] Epoch {epoch+1:03d} | train={tr_loss:.5f} | val={va_loss:.5f}")
+
+        if va_loss < best_val - 1e-6:
+            best_val = va_loss
+            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            print(f"[TFT-Hurdle] Early stop at epoch {epoch+1}. Best val={best_val:.5f}")
+            break
+
+    if best_sd is not None:
+        model.load_state_dict(best_sd)
+
+    return model
+
+
+# ============================================================
+# predict_tft_hurdle
+# 输出格式与原 predict_tft_exposure 完全相同
+# 额外输出 p_active 列供诊断用
+# ============================================================
+
+def predict_tft_hurdle(model, va_ld, apply_funnel_constraint=True):
+    import pandas as pd
+
+    rows = []
+    model.eval()
+
+    with torch.no_grad():
+        for b in va_ld:
+            aux = model(b["x"], b["future_context"], return_aux=True)
+
+            # log_hat shape [B,H,3]，与原模型完全相同
+            pred = torch.expm1(aux["log_hat"]).clamp(min=0.0).cpu().numpy()
+            p_act = aux["p_active"].cpu().numpy()   # [B,H,3]
+
+            if apply_funnel_constraint:
+                # total ≥ buy_box ≥ in_stock（物理约束不变）
+                pred[:, :, 1] = np.minimum(pred[:, :, 1], pred[:, :, 0])
+                pred[:, :, 2] = np.minimum(pred[:, :, 2], pred[:, :, 1])
+
+            B, H = b["future_instock_dph"].shape
+
+            for i in range(B):
+                for h in range(H):
+                    rows.append({
+                        "asin": b["asin"][i],
+                        "order_week": pd.to_datetime(b["target_week"][h][i]),
+                        "horizon": h + 1,
+
+                        # ── 与原格式完全相同 ──
+                        "true_total_dph":    b["future_total_dph"][i, h].item(),
+                        "pred_total_dph":    pred[i, h, 0],
+
+                        "true_buy_box_dph":  b["future_buy_box_dph"][i, h].item(),
+                        "pred_buy_box_dph":  pred[i, h, 1],
+
+                        "true_instock_dph":  b["future_instock_dph"][i, h].item(),
+                        "pred_instock_dph":  pred[i, h, 2],
+
+                        "true_demand":       b["future_demand"][i, h].item(),
+
+                        # ── 额外诊断列（可选）──
+                        "p_active_total":    p_act[i, h, 0],
+                        "p_active_buy_box":  p_act[i, h, 1],
+                        "p_active_instock":  p_act[i, h, 2],
+                    })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# run_tft_hurdle_exposure_forecast
+# 替换原来的 run_tft_exposure_forecast
+# 数据加载、split、评估全部复用原函数
+# ============================================================
+
+def run_tft_hurdle_exposure_forecast(
+    data_raw1,
+    scot_df,
+    n_asins=5000,
+    seed=42,
+    history=52,
+    horizon=20,
+    d_model=64,
+    n_heads=4,
+    batch_size=64,
+    epochs=60,
+    lr=1e-3,
+    patience=8,
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    bce_weight=1.00,
+    mag_weight=1.00,
+    mean_weight=0.20,
+    high_weight_alpha=1.00,
+    horizon_weight_alpha=0.40,
+):
+    print("\n" + "=" * 100)
+    print("TFT-HURDLE EXPOSURE FORECAST")
+    print("=" * 100)
+
+    # ── 数据加载（完全复用原函数）────────────────────────────
+    df = prepare_data_from_sample_scot_intersection(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=n_asins,
+        seed=seed,
+    )
+
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
+
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+
+    tr_ds = ExposureDataset(data, history=history, horizon=horizon, mode="train",  val_weeks=horizon)
+    va_ds = ExposureDataset(data, history=history, horizon=horizon, mode="val",    val_weeks=horizon)
+
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
+
+    print("Train samples:", len(tr_ds))
+    print("Val samples:",   len(va_ds))
+
+    input_dim = next(iter(tr_ld))["x"].shape[-1]
+
+    # ── 模型（Hurdle 版）─────────────────────────────────────
+    model = TFTStyleExposureModelHurdle(
+        input_dim=input_dim,
+        context_dim=context_dim,
+        d_model=d_model,
+        horizon=horizon,
+        n_heads=n_heads,
+        dropout=0.10,
+    )
+
+    print("Input dim:",  input_dim)
+    print("Context dim:", context_dim)
+    print("Params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+    # ── 训练 ─────────────────────────────────────────────────
+    train_tft_hurdle_model(
+        model=model,
+        tr_ld=tr_ld,
+        va_ld=va_ld,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
+        bce_weight=bce_weight,
+        mag_weight=mag_weight,
+        mean_weight=mean_weight,
+        high_weight_alpha=high_weight_alpha,
+        horizon_weight_alpha=horizon_weight_alpha,
+    )
+
+    # ── 预测（输出格式与原版完全相同）───────────────────────
+    pred_df = predict_tft_hurdle(
+        model=model,
+        va_ld=va_ld,
+        apply_funnel_constraint=apply_funnel_constraint,
+    )
+
+    # ── 评估（复用原诊断函数，不改）────────────────────────
+    pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
+    diagnostics = print_exposure_diagnostics(pred_df)
+    exposure_quality = diagnose_exposure_prediction_quality(pred_df)
+    exposure_hat_for_demand = make_external_hat_df_from_tft(pred_df)
+
+    return {
+        "model": model,
+        "forecast_df": pred_df,
+        "diagnostics": diagnostics,
+        "exposure_quality": exposure_quality,
+        "tr_ld": tr_ld,
+        "va_ld": va_ld,
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "exposure_hat_for_demand": exposure_hat_for_demand,
+    }
+
+
+# ============================================================
+# 使用方法（替换原来的 run_tft_exposure_forecast）
+# ============================================================
+#
+# result_hurdle = run_tft_hurdle_exposure_forecast(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=5000,
+#     seed=42,
+#     history=52,
+#     horizon=20,
+#     d_model=64,
+#     n_heads=4,
+#     batch_size=64,
+#     epochs=60,
+#     lr=1e-3,
+#     patience=8,
+#     bce_weight=1.00,    # BCE occurrence loss 权重
+#     mag_weight=1.00,    # magnitude loss 权重
+#     mean_weight=0.20,   # mean scale penalty
+#     apply_funnel_constraint=True,
+# )
+#
+# exposure_hat_for_demand = result_hurdle["exposure_hat_for_demand"]
+#
+# # pred_df 里额外有 p_active_total / p_active_buy_box / p_active_instock
+# # 可以用来诊断 occurrence 的预测质量
+# pred_df = result_hurdle["forecast_df"]
+# print(pred_df[["horizon","p_active_instock","true_instock_dph","pred_instock_dph"]].head(40))
