@@ -1,0 +1,391 @@
+# ============================================================
+# Diagnose predicted in-stock hat vs true in_stock_dph
+# ============================================================
+# Questions:
+#   1. Active 差不差？
+#   2. Magnitude 差不差？
+#   3. 是 h=1 就差，还是 horizon 越长越差？
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
+
+
+def _pick_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _get_exposure_hat_df(obj):
+    """
+    Accept:
+      - exposure_hat_for_demand_calib dataframe
+      - result_best dict
+      - calib_result dict
+      - result_best["result_focus"]["attn_df"]
+    """
+    if isinstance(obj, pd.DataFrame):
+        return obj.copy()
+
+    if isinstance(obj, dict):
+        if "exposure_hat_for_demand_calib" in obj:
+            return obj["exposure_hat_for_demand_calib"].copy()
+
+        if "exposure_hat_for_demand" in obj:
+            return obj["exposure_hat_for_demand"].copy()
+
+        if "result_focus" in obj and isinstance(obj["result_focus"], dict):
+            rf = obj["result_focus"]
+            if "exposure_hat_for_demand_calib" in rf:
+                return rf["exposure_hat_for_demand_calib"].copy()
+            if "exposure_hat_for_demand" in rf:
+                return rf["exposure_hat_for_demand"].copy()
+            if "attn_df" in rf:
+                return rf["attn_df"].copy()
+
+        if "attn_df" in obj:
+            return obj["attn_df"].copy()
+
+    raise ValueError("Cannot extract exposure hat dataframe from input.")
+
+
+def diagnose_instock_hat_vs_true(
+    exposure_hat,
+    data_raw1,
+    asin_col="asin",
+    week_col="order_week",
+    true_col="in_stock_dph",
+    active_threshold="match_true_active_rate",
+    eps=1e-8,
+):
+    """
+    active_threshold:
+      - "match_true_active_rate": choose pred threshold so predicted active rate matches true active rate
+      - numeric value, e.g. 1.0
+    """
+    hat = _get_exposure_hat_df(exposure_hat)
+
+    hat[asin_col] = hat[asin_col].astype(str)
+    hat[week_col] = pd.to_datetime(hat[week_col])
+
+    # Pick predicted in-stock column by priority.
+    pred_col = _pick_col(
+        hat,
+        [
+            "pred_in_stock_dph_calib",
+            "pred_instock_dph_calib",
+            "pred_instock_dph",
+            "pred_in_stock_dph",
+            "attn_instock_dph",
+            "attn_in_stock_dph",
+            "external_instock_dph_hat",
+        ],
+    )
+
+    # If only log column exists, recover level.
+    if pred_col is None:
+        log_col = _pick_col(
+            hat,
+            [
+                "external_instock_dph_hat_log",
+                "pred_instock_dph_log",
+                "pred_in_stock_dph_log",
+                "attn_instock_dph_log",
+            ],
+        )
+        if log_col is None:
+            raise ValueError(f"Cannot find predicted instock column. Available cols: {hat.columns.tolist()}")
+        hat["__pred_instock_level__"] = np.expm1(
+            pd.to_numeric(hat[log_col], errors="coerce").fillna(0.0)
+        ).clip(min=0.0)
+        pred_col = "__pred_instock_level__"
+
+    true_df = data_raw1[[asin_col, week_col, true_col]].copy()
+    true_df[asin_col] = true_df[asin_col].astype(str)
+    true_df[week_col] = pd.to_datetime(true_df[week_col])
+    true_df[true_col] = pd.to_numeric(true_df[true_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    df = hat[[asin_col, week_col, pred_col]].copy()
+    df = df.rename(columns={pred_col: "pred_instock"})
+    df["pred_instock"] = pd.to_numeric(df["pred_instock"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if "horizon" not in df.columns:
+        if "fcst_week_index" in hat.columns:
+            df["horizon"] = hat["fcst_week_index"].values
+        else:
+            # fallback: rank weeks within ASIN
+            df["horizon"] = df.groupby(asin_col)[week_col].rank(method="dense").astype(int)
+
+    df = df.merge(true_df, on=[asin_col, week_col], how="left")
+    df = df.rename(columns={true_col: "true_instock"})
+    df["true_instock"] = pd.to_numeric(df["true_instock"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    df["true_active"] = (df["true_instock"] > 0).astype(int)
+
+    # ------------------------------------------------------------
+    # Choose threshold for predicted active.
+    # ------------------------------------------------------------
+    if active_threshold == "match_true_active_rate":
+        true_active_rate = df["true_active"].mean()
+        # If true active rate = 0.8, choose threshold at 20th percentile of prediction.
+        q = max(0.0, min(1.0, 1.0 - true_active_rate))
+        threshold = float(df["pred_instock"].quantile(q))
+    else:
+        threshold = float(active_threshold)
+
+    df["pred_active"] = (df["pred_instock"] > threshold).astype(int)
+
+    print("\n" + "=" * 100)
+    print("IN-STOCK HAT VS TRUE DIAGNOSTIC")
+    print("=" * 100)
+    print("Prediction column used:", pred_col)
+    print("Rows:", len(df))
+    print("ASINs:", df[asin_col].nunique())
+    print("Date range:", df[week_col].min(), "to", df[week_col].max())
+    print("Active threshold:", threshold)
+    print("True active rate:", round(df["true_active"].mean(), 5))
+    print("Pred active rate:", round(df["pred_active"].mean(), 5))
+
+    # ------------------------------------------------------------
+    # Overall active metrics
+    # ------------------------------------------------------------
+    try:
+        auc = roc_auc_score(df["true_active"], df["pred_instock"])
+    except Exception:
+        auc = np.nan
+
+    precision = precision_score(df["true_active"], df["pred_active"], zero_division=0)
+    recall = recall_score(df["true_active"], df["pred_active"], zero_division=0)
+    f1 = f1_score(df["true_active"], df["pred_active"], zero_division=0)
+
+    active_summary = pd.DataFrame([{
+        "active_AUC_score_based": auc,
+        "active_precision_threshold": precision,
+        "active_recall_threshold": recall,
+        "active_f1_threshold": f1,
+        "threshold": threshold,
+        "true_active_rate": df["true_active"].mean(),
+        "pred_active_rate": df["pred_active"].mean(),
+    }])
+
+    print("\n" + "=" * 100)
+    print("1. ACTIVE DIAGNOSTIC")
+    print("=" * 100)
+    print(active_summary.round(5).to_string(index=False))
+
+    # ------------------------------------------------------------
+    # Overall magnitude metrics
+    # ------------------------------------------------------------
+    df["abs_err"] = (df["pred_instock"] - df["true_instock"]).abs()
+    df["under"] = np.maximum(df["true_instock"] - df["pred_instock"], 0.0)
+    df["over"] = np.maximum(df["pred_instock"] - df["true_instock"], 0.0)
+    df["ratio"] = df["pred_instock"] / (df["true_instock"] + eps)
+    df["log_abs_err"] = (np.log1p(df["pred_instock"]) - np.log1p(df["true_instock"])).abs()
+
+    denom = df["true_instock"].sum() + eps
+
+    mag_summary = pd.DataFrame([{
+        "true_mean": df["true_instock"].mean(),
+        "pred_mean": df["pred_instock"].mean(),
+        "pred_true_ratio_mean": df["pred_instock"].mean() / (df["true_instock"].mean() + eps),
+        "WAPE": df["abs_err"].sum() / denom,
+        "underbias": df["under"].sum() / denom,
+        "overbias": df["over"].sum() / denom,
+        "log_MAE": df["log_abs_err"].mean(),
+        "median_pred_true_ratio_when_true_pos": df.loc[df["true_instock"] > 0, "ratio"].median(),
+        "p25_ratio_when_true_pos": df.loc[df["true_instock"] > 0, "ratio"].quantile(0.25),
+        "p75_ratio_when_true_pos": df.loc[df["true_instock"] > 0, "ratio"].quantile(0.75),
+    }])
+
+    print("\n" + "=" * 100)
+    print("2. MAGNITUDE DIAGNOSTIC")
+    print("=" * 100)
+    print(mag_summary.round(5).to_string(index=False))
+
+    # ------------------------------------------------------------
+    # Active vs magnitude error decomposition
+    # ------------------------------------------------------------
+    miss_active = (df["true_active"] == 1) & (df["pred_active"] == 0)
+    false_active = (df["true_active"] == 0) & (df["pred_active"] == 1)
+    both_active = (df["true_active"] == 1) & (df["pred_active"] == 1)
+
+    decomp = pd.DataFrame([{
+        "n": len(df),
+        "miss_active_rate": miss_active.mean(),
+        "false_active_rate": false_active.mean(),
+        "both_active_rate": both_active.mean(),
+
+        "under_from_missed_active": df.loc[miss_active, "under"].sum() / denom,
+        "under_from_both_active_mag": df.loc[both_active, "under"].sum() / denom,
+
+        "over_from_false_active": df.loc[false_active, "over"].sum() / denom,
+        "over_from_both_active_mag": df.loc[both_active, "over"].sum() / denom,
+    }])
+
+    print("\n" + "=" * 100)
+    print("3. ERROR DECOMPOSITION: ACTIVE VS MAGNITUDE")
+    print("=" * 100)
+    print(decomp.round(5).to_string(index=False))
+
+    # ------------------------------------------------------------
+    # Horizon-level metrics
+    # ------------------------------------------------------------
+    by_h = []
+
+    for h, g in df.groupby("horizon"):
+        denom_h = g["true_instock"].sum() + eps
+
+        try:
+            auc_h = roc_auc_score(g["true_active"], g["pred_instock"])
+        except Exception:
+            auc_h = np.nan
+
+        miss_h = (g["true_active"] == 1) & (g["pred_active"] == 0)
+        false_h = (g["true_active"] == 0) & (g["pred_active"] == 1)
+        both_h = (g["true_active"] == 1) & (g["pred_active"] == 1)
+
+        by_h.append({
+            "horizon": int(h),
+            "n": len(g),
+            "true_mean": g["true_instock"].mean(),
+            "pred_mean": g["pred_instock"].mean(),
+            "ratio_mean": g["pred_instock"].mean() / (g["true_instock"].mean() + eps),
+            "WAPE": g["abs_err"].sum() / denom_h,
+            "underbias": g["under"].sum() / denom_h,
+            "overbias": g["over"].sum() / denom_h,
+            "active_AUC": auc_h,
+            "true_active_rate": g["true_active"].mean(),
+            "pred_active_rate": g["pred_active"].mean(),
+            "miss_active_rate": miss_h.mean(),
+            "false_active_rate": false_h.mean(),
+            "under_from_missed_active": g.loc[miss_h, "under"].sum() / denom_h,
+            "under_from_both_active_mag": g.loc[both_h, "under"].sum() / denom_h,
+            "over_from_false_active": g.loc[false_h, "over"].sum() / denom_h,
+            "over_from_both_active_mag": g.loc[both_h, "over"].sum() / denom_h,
+            "log_MAE": g["log_abs_err"].mean(),
+        })
+
+    by_h = pd.DataFrame(by_h).sort_values("horizon")
+
+    print("\n" + "=" * 100)
+    print("4. BY-HORIZON DIAGNOSTIC")
+    print("=" * 100)
+    print(by_h.round(5).to_string(index=False))
+
+    # ------------------------------------------------------------
+    # Horizon block summary
+    # ------------------------------------------------------------
+    def block_name(h):
+        if h <= 5:
+            return "short_h1_5"
+        elif h <= 12:
+            return "mid_h6_12"
+        else:
+            return "long_h13_20"
+
+    df["h_block"] = df["horizon"].apply(block_name)
+
+    block_rows = []
+    for b, g in df.groupby("h_block"):
+        denom_b = g["true_instock"].sum() + eps
+
+        try:
+            auc_b = roc_auc_score(g["true_active"], g["pred_instock"])
+        except Exception:
+            auc_b = np.nan
+
+        miss_b = (g["true_active"] == 1) & (g["pred_active"] == 0)
+        both_b = (g["true_active"] == 1) & (g["pred_active"] == 1)
+
+        block_rows.append({
+            "block": b,
+            "n": len(g),
+            "true_mean": g["true_instock"].mean(),
+            "pred_mean": g["pred_instock"].mean(),
+            "ratio_mean": g["pred_instock"].mean() / (g["true_instock"].mean() + eps),
+            "WAPE": g["abs_err"].sum() / denom_b,
+            "underbias": g["under"].sum() / denom_b,
+            "overbias": g["over"].sum() / denom_b,
+            "active_AUC": auc_b,
+            "miss_active_rate": miss_b.mean(),
+            "under_from_missed_active": g.loc[miss_b, "under"].sum() / denom_b,
+            "under_from_both_active_mag": g.loc[both_b, "under"].sum() / denom_b,
+            "log_MAE": g["log_abs_err"].mean(),
+        })
+
+    by_block = pd.DataFrame(block_rows)
+
+    print("\n" + "=" * 100)
+    print("5. BY-HORIZON-BLOCK DIAGNOSTIC")
+    print("=" * 100)
+    print(by_block.round(5).to_string(index=False))
+
+    # ------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------
+    plot_cols = [
+        ("ratio_mean", "pred / true mean ratio"),
+        ("WAPE", "WAPE"),
+        ("underbias", "underbias"),
+        ("overbias", "overbias"),
+        ("active_AUC", "active AUC"),
+        ("miss_active_rate", "miss active rate"),
+        ("under_from_missed_active", "under from missed active"),
+        ("under_from_both_active_mag", "under from magnitude among both active"),
+    ]
+
+    for col, title in plot_cols:
+        plt.figure(figsize=(7, 4))
+        plt.plot(by_h["horizon"], by_h[col], marker="o")
+        plt.title(f"In-stock hat vs true: {title} by horizon")
+        plt.xlabel("horizon")
+        plt.ylabel(col)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    # Scatter log scale
+    plt.figure(figsize=(5, 5))
+    plt.scatter(np.log1p(df["true_instock"]), np.log1p(df["pred_instock"]), alpha=0.20, s=8)
+    lo = min(np.log1p(df["true_instock"]).min(), np.log1p(df["pred_instock"]).min())
+    hi = max(np.log1p(df["true_instock"]).max(), np.log1p(df["pred_instock"]).max())
+    plt.plot([lo, hi], [lo, hi], linestyle="--")
+    plt.title("log1p predicted in-stock vs log1p true in-stock")
+    plt.xlabel("log1p true in_stock_dph")
+    plt.ylabel("log1p predicted in_stock_hat")
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "merged": df,
+        "active_summary": active_summary,
+        "mag_summary": mag_summary,
+        "decomp": decomp,
+        "by_horizon": by_h,
+        "by_block": by_block,
+        "threshold": threshold,
+        "pred_col": pred_col,
+    }
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+# If you want calibrated in-stock:
+instock_hat_diag = diagnose_instock_hat_vs_true(
+    exposure_hat=exposure_hat_for_demand_calib,
+    data_raw1=data_raw1,
+    active_threshold="match_true_active_rate",
+)
+
+# If you want raw best-attn in-stock instead, use:
+# instock_hat_diag_raw = diagnose_instock_hat_vs_true(
+#     exposure_hat=result_best["exposure_hat_for_demand"],
+#     data_raw1=data_raw1,
+#     active_threshold="match_true_active_rate",
+# )
