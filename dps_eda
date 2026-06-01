@@ -1,0 +1,352 @@
+# ============================================================
+# EDA: Relationship between DPHs and Demand
+# Questions:
+#   1. If DPH = 0, how often is demand > 0?
+#   2. Is demand roughly linear in DPH?
+#   3. Which DPH is most predictive of demand?
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import r2_score, mean_absolute_error
+
+
+def run_dph_demand_relationship_eda(
+    data_raw,
+    asin_col="asin",
+    week_col="order_week",
+    demand_col="fbi_demand",
+    dph_cols=("total_dph", "buy_box_dph", "in_stock_dph"),
+    n_bins=10,
+    eps=1e-8,
+):
+    df = data_raw.copy()
+
+    df[asin_col] = df[asin_col].astype(str)
+    df[week_col] = pd.to_datetime(df[week_col])
+
+    needed = [asin_col, week_col, demand_col] + list(dph_cols)
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    for c in [demand_col] + list(dph_cols):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    df["demand_active"] = (df[demand_col] > 0).astype(int)
+
+    print("\n" + "=" * 120)
+    print("1. BASIC SUMMARY")
+    print("=" * 120)
+
+    basic_rows = []
+    for c in dph_cols:
+        basic_rows.append({
+            "metric": c,
+            "mean": df[c].mean(),
+            "median": df[c].median(),
+            "p75": df[c].quantile(0.75),
+            "p90": df[c].quantile(0.90),
+            "p95": df[c].quantile(0.95),
+            "p99": df[c].quantile(0.99),
+            "zero_rate": (df[c] <= 0).mean(),
+            "active_rate": (df[c] > 0).mean(),
+        })
+
+    basic = pd.DataFrame(basic_rows)
+    print(basic.round(4).to_string(index=False))
+
+    print("\nDemand summary:")
+    print(df[demand_col].describe().round(4).to_string())
+    print("Demand active rate:", round((df[demand_col] > 0).mean(), 4))
+
+    # ============================================================
+    # 2. Zero DPH but demand positive
+    # ============================================================
+
+    print("\n" + "=" * 120)
+    print("2. DPH = 0 BUT DEMAND > 0")
+    print("=" * 120)
+
+    zero_rows = []
+
+    for c in dph_cols:
+        zero_mask = df[c] <= 0
+        positive_demand_mask = df[demand_col] > 0
+
+        n_zero = zero_mask.sum()
+        n_zero_demand_pos = (zero_mask & positive_demand_mask).sum()
+
+        zero_rows.append({
+            "dph_col": c,
+            "n_rows": len(df),
+            "n_dph_zero": int(n_zero),
+            "dph_zero_rate": n_zero / max(len(df), 1),
+            "P(demand>0 | dph=0)": n_zero_demand_pos / max(n_zero, 1),
+            "n_dph_zero_and_demand_pos": int(n_zero_demand_pos),
+            "share_of_all_positive_demand": n_zero_demand_pos / max(positive_demand_mask.sum(), 1),
+        })
+
+    zero_summary = pd.DataFrame(zero_rows)
+    print(zero_summary.round(6).to_string(index=False))
+
+    # All three zero
+    all_zero_mask = np.ones(len(df), dtype=bool)
+    for c in dph_cols:
+        all_zero_mask &= (df[c] <= 0)
+
+    positive_demand_mask = df[demand_col] > 0
+
+    all_zero_summary = pd.DataFrame([{
+        "condition": "all_three_dph_zero",
+        "n_rows": len(df),
+        "n_all_zero": int(all_zero_mask.sum()),
+        "all_zero_rate": all_zero_mask.mean(),
+        "P(demand>0 | all_three_zero)": (all_zero_mask & positive_demand_mask).sum() / max(all_zero_mask.sum(), 1),
+        "n_all_zero_and_demand_pos": int((all_zero_mask & positive_demand_mask).sum()),
+        "share_of_all_positive_demand": (all_zero_mask & positive_demand_mask).sum() / max(positive_demand_mask.sum(), 1),
+    }])
+
+    print("\nAll three DPH zero:")
+    print(all_zero_summary.round(6).to_string(index=False))
+
+    # ============================================================
+    # 3. Demand > 0 but DPH zero / positive
+    # ============================================================
+
+    print("\n" + "=" * 120)
+    print("3. WHEN DEMAND > 0, ARE DPHs POSITIVE?")
+    print("=" * 120)
+
+    active_df = df[df[demand_col] > 0].copy()
+
+    active_rows = []
+    for c in dph_cols:
+        active_rows.append({
+            "dph_col": c,
+            "n_demand_positive": len(active_df),
+            "P(dph>0 | demand>0)": (active_df[c] > 0).mean(),
+            "P(dph=0 | demand>0)": (active_df[c] <= 0).mean(),
+            "dph_mean_when_demand_positive": active_df[c].mean(),
+            "dph_median_when_demand_positive": active_df[c].median(),
+        })
+
+    active_summary = pd.DataFrame(active_rows)
+    print(active_summary.round(6).to_string(index=False))
+
+    # ============================================================
+    # 4. Demand per DPH ratio
+    # ============================================================
+
+    print("\n" + "=" * 120)
+    print("4. DEMAND / DPH RATIO DISTRIBUTION")
+    print("=" * 120)
+
+    ratio_rows = []
+
+    for c in dph_cols:
+        ratio_col = f"demand_per_{c}"
+        valid = df[c] > 0
+        df[ratio_col] = np.where(valid, df[demand_col] / (df[c] + eps), np.nan)
+
+        s = df.loc[valid, ratio_col].replace([np.inf, -np.inf], np.nan).dropna()
+
+        ratio_rows.append({
+            "ratio": ratio_col,
+            "n_valid_dph_positive": len(s),
+            "mean": s.mean(),
+            "median": s.median(),
+            "p75": s.quantile(0.75),
+            "p90": s.quantile(0.90),
+            "p95": s.quantile(0.95),
+            "p99": s.quantile(0.99),
+        })
+
+    ratio_summary = pd.DataFrame(ratio_rows)
+    print(ratio_summary.round(8).to_string(index=False))
+
+    # ============================================================
+    # 5. Binned relationship: DPH bins -> demand mean
+    # ============================================================
+
+    print("\n" + "=" * 120)
+    print("5. BINNED RELATIONSHIP: DPH BIN -> DEMAND")
+    print("=" * 120)
+
+    binned_tables = {}
+
+    for c in dph_cols:
+        sub = df[[c, demand_col]].copy()
+        sub = sub[sub[c] > 0].copy()
+
+        if len(sub) == 0:
+            continue
+
+        # qcut on rank avoids duplicate bin edge errors
+        sub["dph_bin"] = pd.qcut(
+            sub[c].rank(method="first"),
+            q=n_bins,
+            labels=False,
+            duplicates="drop",
+        )
+
+        tbl = (
+            sub.groupby("dph_bin")
+            .agg(
+                n=(c, "size"),
+                dph_mean=(c, "mean"),
+                dph_median=(c, "median"),
+                demand_mean=(demand_col, "mean"),
+                demand_median=(demand_col, "median"),
+                demand_active_rate=(demand_col, lambda x: (x > 0).mean()),
+            )
+            .reset_index()
+        )
+
+        tbl["demand_per_dph_mean"] = tbl["demand_mean"] / (tbl["dph_mean"] + eps)
+
+        binned_tables[c] = tbl
+
+        print(f"\nBinned table for {c}:")
+        print(tbl.round(6).to_string(index=False))
+
+        plt.figure(figsize=(7, 4))
+        plt.plot(tbl["dph_mean"], tbl["demand_mean"], marker="o")
+        plt.title(f"Binned relationship: {c} vs demand")
+        plt.xlabel(f"{c} bin mean")
+        plt.ylabel("demand mean")
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure(figsize=(7, 4))
+        plt.plot(tbl["dph_mean"], tbl["demand_per_dph_mean"], marker="o")
+        plt.title(f"Demand per DPH by {c} level")
+        plt.xlabel(f"{c} bin mean")
+        plt.ylabel("demand_mean / dph_mean")
+        plt.tight_layout()
+        plt.show()
+
+    # ============================================================
+    # 6. Linear and log-linear regressions
+    # ============================================================
+
+    print("\n" + "=" * 120)
+    print("6. SIMPLE REGRESSIONS")
+    print("=" * 120)
+
+    reg_rows = []
+
+    y = df[demand_col].values.astype(float)
+
+    for c in dph_cols:
+        x = df[[c]].values.astype(float)
+
+        # demand ~ dph
+        lin = LinearRegression()
+        lin.fit(x, y)
+        pred = lin.predict(x).clip(min=0)
+
+        reg_rows.append({
+            "model": f"demand ~ {c}",
+            "scale": "level",
+            "coef": lin.coef_[0],
+            "intercept": lin.intercept_,
+            "R2": r2_score(y, pred),
+            "MAE": mean_absolute_error(y, pred),
+        })
+
+        # log1p(demand) ~ log1p(dph)
+        xlog = np.log1p(df[[c]].values.astype(float))
+        ylog = np.log1p(y)
+
+        lin_log = LinearRegression()
+        lin_log.fit(xlog, ylog)
+        pred_log = lin_log.predict(xlog)
+        pred_level = np.expm1(pred_log).clip(min=0)
+
+        reg_rows.append({
+            "model": f"log1p(demand) ~ log1p({c})",
+            "scale": "log-log",
+            "coef": lin_log.coef_[0],
+            "intercept": lin_log.intercept_,
+            "R2": r2_score(ylog, pred_log),
+            "MAE_level_after_expm1": mean_absolute_error(y, pred_level),
+        })
+
+    # all 3 together
+    X3 = df[list(dph_cols)].values.astype(float)
+    lin3 = Ridge(alpha=1.0)
+    lin3.fit(X3, y)
+    pred3 = lin3.predict(X3).clip(min=0)
+
+    reg_rows.append({
+        "model": "demand ~ total + buybox + instock",
+        "scale": "level",
+        "coef_total": lin3.coef_[0],
+        "coef_buybox": lin3.coef_[1],
+        "coef_instock": lin3.coef_[2],
+        "intercept": lin3.intercept_,
+        "R2": r2_score(y, pred3),
+        "MAE": mean_absolute_error(y, pred3),
+    })
+
+    X3log = np.log1p(df[list(dph_cols)].values.astype(float))
+    ylog = np.log1p(y)
+
+    lin3log = Ridge(alpha=1.0)
+    lin3log.fit(X3log, ylog)
+    pred3log = lin3log.predict(X3log)
+    pred3level = np.expm1(pred3log).clip(min=0)
+
+    reg_rows.append({
+        "model": "log1p(demand) ~ log1p(total,buybox,instock)",
+        "scale": "log-log",
+        "coef_total": lin3log.coef_[0],
+        "coef_buybox": lin3log.coef_[1],
+        "coef_instock": lin3log.coef_[2],
+        "intercept": lin3log.intercept_,
+        "R2": r2_score(ylog, pred3log),
+        "MAE_level_after_expm1": mean_absolute_error(y, pred3level),
+    })
+
+    reg_summary = pd.DataFrame(reg_rows)
+    print(reg_summary.round(6).to_string(index=False))
+
+    # ============================================================
+    # 7. Scatter plots log scale
+    # ============================================================
+
+    for c in dph_cols:
+        plt.figure(figsize=(5, 5))
+        plt.scatter(np.log1p(df[c]), np.log1p(df[demand_col]), alpha=0.25, s=8)
+        plt.title(f"log1p({c}) vs log1p(demand)")
+        plt.xlabel(f"log1p({c})")
+        plt.ylabel("log1p(demand)")
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "zero_summary": zero_summary,
+        "all_zero_summary": all_zero_summary,
+        "active_summary": active_summary,
+        "ratio_summary": ratio_summary,
+        "binned_tables": binned_tables,
+        "reg_summary": reg_summary,
+        "data_with_ratios": df,
+    }
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+dph_demand_eda = run_dph_demand_relationship_eda(
+    data_raw=data_raw1,
+    asin_col="asin",
+    week_col="order_week",
+    demand_col="fbi_demand",
+    dph_cols=("total_dph", "buy_box_dph", "in_stock_dph"),
+    n_bins=10,
+)
