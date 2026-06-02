@@ -1,28 +1,14 @@
+
 # ============================================================
-# One-Cell Version:
-# Chronos-2 Fine-Tuned for in_stock_dph
-# Compare with your original TCN exposure model
-#
-# 你只需要改最下面 CONFIG 部分：
-#   RUN_TCN_FIRST = True / False
-#
-# 如果你还没跑 TCN:
-#   RUN_TCN_FIRST = True
-#
-# 如果你已经有:
-#   pred_df = result_tcn["forecast_df"]
-# 那么:
-#   RUN_TCN_FIRST = False
-#
-# 输出：
-#   result_chronos_instock
-#   chronos_pred_df
-#   compare_df
-#   summary
-#   by_horizon
+# 0. Environment guard: 必须放在 autogluon / transformers import 前
 # ============================================================
 
 import os
+
+os.environ["TRANSFORMERS_NO_TF"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import gc
 import shutil
 import warnings
@@ -35,7 +21,7 @@ from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
 
 
 # ============================================================
-# 0. Helper functions
+# 1. Helper functions
 # ============================================================
 
 def _safe_numeric_chronos(s, fill=0.0):
@@ -51,32 +37,25 @@ def _wape_chronos(y, p):
 def _corr_chronos(y, p):
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
-
     if np.std(y) < 1e-8 or np.std(p) < 1e-8:
         return np.nan
-
     return float(np.corrcoef(y, p)[0, 1])
 
 
 def _safe_spearman_chronos(y, p):
     y_rank = pd.Series(np.asarray(y, dtype=float)).rank(method="average").values
     p_rank = pd.Series(np.asarray(p, dtype=float)).rank(method="average").values
-
     if np.std(y_rank) < 1e-8 or np.std(p_rank) < 1e-8:
         return np.nan
-
     return float(np.corrcoef(y_rank, p_rank)[0, 1])
 
 
 def _auc_chronos(y_binary, score):
     try:
         from sklearn.metrics import roc_auc_score
-
         if len(np.unique(y_binary)) < 2:
             return np.nan
-
         return float(roc_auc_score(y_binary, score))
-
     except Exception:
         return np.nan
 
@@ -87,6 +66,7 @@ def _check_required_old_functions():
         "filter_extreme_asins",
         "add_explicit_event_features",
         "_encode_static_features",
+        "run_exposure_v2",
     ]
 
     missing = [name for name in required if name not in globals()]
@@ -100,7 +80,7 @@ def _check_required_old_functions():
 
 
 # ============================================================
-# 1. Prepare Chronos-2 data for target = in_stock_dph
+# 2. Prepare Chronos-2 data
 # ============================================================
 
 def prepare_instock_chronos2_df(
@@ -119,12 +99,9 @@ def prepare_instock_chronos2_df(
     target:
         in_stock_dph
 
-    known covariates:
-        尽量和你 demand Chronos-2 的特征风格一致。
-
     注意：
-        glance_view_count 默认不用，因为未来 20 周通常不可知。
-        如果你确认它是 future known / forecasted，可以设置 use_glance_view_count=True。
+        glance_view_count 默认不用，因为未来20周通常不可知。
+        如果你确认它未来可知，可以 use_glance_view_count=True。
     """
 
     _check_required_old_functions()
@@ -147,7 +124,7 @@ def prepare_instock_chronos2_df(
     if "in_stock_dph" not in df.columns:
         raise ValueError("data_raw1 里面必须有 in_stock_dph 这一列。")
 
-    # target
+    # target: in_stock_dph
     df["in_stock_dph"] = (
         _safe_numeric_chronos(df["in_stock_dph"], fill=0.0)
         .clip(lower=0.0)
@@ -175,7 +152,7 @@ def prepare_instock_chronos2_df(
     else:
         df["scot_oos"] = 0.0
 
-    # time features
+    # 时间特征
     df["order_month"] = df["order_week"].dt.month.astype(float)
     df["month_sin"] = np.sin(2 * np.pi * df["order_month"] / 12.0)
     df["month_cos"] = np.cos(2 * np.pi * df["order_month"] / 12.0)
@@ -185,17 +162,17 @@ def prepare_instock_chronos2_df(
     df["season_summer"] = df["order_month"].isin([6, 7, 8]).astype(float)
     df["season_fall"] = df["order_month"].isin([9, 10, 11]).astype(float)
 
-    # event features from your original code
+    # 复用你原来的 event features
     df, explicit_event_cols = add_explicit_event_features(
         df,
         week_col="order_week",
         event_window_weeks=4,
     )
 
-    # static features from your original code
+    # 复用你原来的 static features
     df, static_cols = _encode_static_features(df)
 
-    # demand Chronos-2 style features
+    # 和 demand Chronos-2 类似的 continuous covariates
     chronos_demand_style_cols = [
         "historical_demand_max",
         "historical_demand_median",
@@ -219,7 +196,6 @@ def prepare_instock_chronos2_df(
     distance_cols = [c for c in df.columns if c.startswith("distance_")]
 
     optional_cols = []
-
     if use_glance_view_count and "glance_view_count" in df.columns:
         optional_cols.append("glance_view_count")
 
@@ -263,7 +239,7 @@ def prepare_instock_chronos2_df(
 
 
 # ============================================================
-# 2. Build train / future split
+# 3. Build AutoGluon train / future split
 # ============================================================
 
 def build_instock_chronos2_train_future(
@@ -345,7 +321,7 @@ def build_instock_chronos2_train_future(
 
 
 # ============================================================
-# 3. Train and predict Chronos-2
+# 4. Train and predict Chronos-2
 # ============================================================
 
 def train_predict_instock_chronos2(
@@ -354,6 +330,7 @@ def train_predict_instock_chronos2(
     history=52,
     horizon=20,
     quantile_levels=None,
+    main_quantile="0.5",  # 可改成 "0.7"
     ag_model_path="AutogluonModels/ag_InStockDPH_Chronos2_FineTuned",
     time_limit=14400,
     fine_tune_steps=2000,
@@ -410,6 +387,29 @@ def train_predict_instock_chronos2(
         enable_ensemble=False,
     )
 
+    # ============================================================
+    # Guard: 检查 Chronos-2 是否真的训练成功
+    # ============================================================
+    try:
+        lb = predictor.leaderboard(silent=True)
+
+        print("\n" + "=" * 100)
+        print("Chronos-2 Leaderboard")
+        print("=" * 100)
+        print(lb)
+
+        if lb is None or len(lb) == 0:
+            raise RuntimeError(
+                "Chronos-2 training failed: leaderboard is empty. "
+                "No trained model can predict."
+            )
+
+    except Exception as e:
+        raise RuntimeError(
+            "Chronos-2 training failed before prediction. "
+            "Please check dependency / GPU / model loading issue."
+        ) from e
+
     print("\n" + "=" * 100)
     print("Predicting in_stock_dph with Chronos-2")
     print("=" * 100)
@@ -428,15 +428,20 @@ def train_predict_instock_chronos2(
     pred_df["asin"] = pred_df["asin"].astype(str)
     pred_df["order_week"] = pd.to_datetime(pred_df["order_week"])
 
-    # Handle column names robustly: AutoGluon may return "0.5" or 0.5
     col_map = {str(c): c for c in pred_df.columns}
 
-    if "0.5" in col_map:
+    # 主预测：默认 p50；如果你想用 p70，把 main_quantile 改成 "0.7"
+    if main_quantile in col_map:
+        pred_df["chronos_pred_instock_dph"] = pred_df[col_map[main_quantile]]
+        print(f"Main Chronos prediction uses quantile: p{int(float(main_quantile) * 100)}")
+    elif "0.5" in col_map:
         pred_df["chronos_pred_instock_dph"] = pred_df[col_map["0.5"]]
+        print("Main Chronos prediction uses fallback quantile: p50")
     elif "mean" in pred_df.columns:
         pred_df["chronos_pred_instock_dph"] = pred_df["mean"]
+        print("Main Chronos prediction uses fallback: mean")
     else:
-        raise ValueError("AutoGluon prediction 没有 0.5 或 mean 列。")
+        raise ValueError("AutoGluon prediction 没有 main quantile / 0.5 / mean 列。")
 
     quantile_rename = {
         "0.1": "chronos_p10_instock_dph",
@@ -482,7 +487,7 @@ def train_predict_instock_chronos2(
 
 
 # ============================================================
-# 4. Compare Chronos-2 vs your TCN
+# 5. Compare Chronos-2 vs TCN
 # ============================================================
 
 def compare_instock_chronos_vs_tcn(
@@ -641,208 +646,177 @@ def compare_instock_chronos_vs_tcn(
 
 
 # ============================================================
-# 5. One-click wrapper
+# 6. CONFIG: 主要改这里
 # ============================================================
-
-def run_instock_chronos2_compare_with_tcn(
-    data_raw1,
-    scot_df,
-    tcn_pred_df,
-    n_asins=5000,
-    seed=42,
-    history=52,
-    horizon=20,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    use_glance_view_count=False,
-    ag_time_limit=14400,
-    fine_tune_steps=2000,
-    fine_tune_lr=1e-6,
-    ag_model_path="AutogluonModels/ag_InStockDPH_Chronos2_FineTuned",
-    save_compare_path=None,
-):
-    print("\n" + "=" * 100)
-    print("RUN: Chronos-2 Fine-Tuned for in_stock_dph vs Your TCN")
-    print("=" * 100)
-
-    df, known_covariates_list = prepare_instock_chronos2_df(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
-        dph_cap_q=dph_cap_q,
-        remove_extreme=remove_extreme,
-        extreme_q=extreme_q,
-        use_glance_view_count=use_glance_view_count,
-    )
-
-    predictor, chronos_pred_df = train_predict_instock_chronos2(
-        df=df,
-        known_covariates_list=known_covariates_list,
-        history=history,
-        horizon=horizon,
-        ag_model_path=ag_model_path,
-        time_limit=ag_time_limit,
-        fine_tune_steps=fine_tune_steps,
-        fine_tune_lr=fine_tune_lr,
-    )
-
-    comparison = compare_instock_chronos_vs_tcn(
-        tcn_pred_df=tcn_pred_df,
-        chronos_pred_df=chronos_pred_df,
-        save_path=save_compare_path,
-    )
-
-    gc.collect()
-
-    return {
-        "predictor": predictor,
-        "chronos_pred_df": chronos_pred_df,
-        "comparison": comparison,
-        "known_covariates_list": known_covariates_list,
-        "chronos_data": df,
-    }
-
-
-# ============================================================
-# 6. CONFIG: 你主要改这里
-# ============================================================
-
-RUN_TCN_FIRST = True
 
 N_ASINS = 5000
 SEED = 42
 HISTORY = 52
 HORIZON = 20
 
-# Chronos-2 参数：和 demand 那个保持一致
+# Chronos 参数
 AG_TIME_LIMIT = 14400
 FINE_TUNE_STEPS = 2000
 FINE_TUNE_LR = 1e-6
 
-# 默认不要用 glance_view_count，除非你确认未来20周这个特征可知
+# 主预测分位数：
+#   "0.5" = p50
+#   "0.7" = p70
+CHRONOS_MAIN_QUANTILE = "0.5"
+
+# 默认不要用 glance_view_count，除非你确认未来20周它可知
 USE_GLANCE_VIEW_COUNT = False
 
-# 模型保存路径
 AG_MODEL_PATH = "AutogluonModels/ag_InStockDPH_Chronos2_FineTuned"
-
-# 可选保存比较结果
 SAVE_COMPARE_PATH = "chronos2_instock_compare_df.parquet"
 
 
 # ============================================================
-# 7. RUN
+# 7. RUN STEP 1: 先跑 Chronos-2
 # ============================================================
 
-if RUN_TCN_FIRST:
-    print("\n" + "=" * 100)
-    print("Step 1: Run your original TCN exposure model first")
-    print("=" * 100)
-
-    if "run_exposure_v2" not in globals():
-        raise NameError(
-            "当前 notebook 里没有找到 run_exposure_v2。\n"
-            "请先运行你原来的 TCN exposure model cell。"
-        )
-
-    result_tcn = run_exposure_v2(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        n_asins=N_ASINS,
-        seed=SEED,
-        history=HISTORY,
-        horizon=HORIZON,
-        d_model=64,
-        n_heads=4,
-        batch_size=64,
-        epochs=60,
-        lr=1e-3,
-        patience=8,
-        dph_cap_q=0.995,
-        remove_extreme=True,
-        extreme_q=0.99,
-        apply_funnel_constraint=True,
-        anchor_decay=0.08,
-        bce_weight=1.00,
-        mag_weight=1.00,
-        mean_weight=0.20,
-        horizon_weight_alpha=0.40,
-        high_weight_alpha=1.00,
-    )
-
-    pred_df = result_tcn["forecast_df"]
-
-else:
-    print("\n" + "=" * 100)
-    print("Step 1: Use existing TCN pred_df")
-    print("=" * 100)
-
-    if "pred_df" not in globals():
-        raise NameError(
-            "你设置了 RUN_TCN_FIRST=False，但是当前环境里没有 pred_df。\n"
-            "请先定义：pred_df = result_tcn['forecast_df']"
-        )
-
-
 print("\n" + "=" * 100)
-print("Step 2: Run Chronos-2 for in_stock_dph and compare")
+print("Step 1: Run Chronos-2 first for in_stock_dph")
 print("=" * 100)
 
-result_chronos_instock = run_instock_chronos2_compare_with_tcn(
+chronos_df, known_covariates_list = prepare_instock_chronos2_df(
     data_raw1=data_raw1,
     scot_df=scot_df,
-    tcn_pred_df=pred_df,
     n_asins=N_ASINS,
     seed=SEED,
-    history=HISTORY,
-    horizon=HORIZON,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
     use_glance_view_count=USE_GLANCE_VIEW_COUNT,
-    ag_time_limit=AG_TIME_LIMIT,
-    fine_tune_steps=FINE_TUNE_STEPS,
-    fine_tune_lr=FINE_TUNE_LR,
-    ag_model_path=AG_MODEL_PATH,
-    save_compare_path=SAVE_COMPARE_PATH,
 )
 
-chronos_pred_df = result_chronos_instock["chronos_pred_df"]
-compare_df = result_chronos_instock["comparison"]["compare_df"]
-summary = result_chronos_instock["comparison"]["summary"]
-by_horizon = result_chronos_instock["comparison"]["by_horizon"]
+chronos_predictor, chronos_pred_df = train_predict_instock_chronos2(
+    df=chronos_df,
+    known_covariates_list=known_covariates_list,
+    history=HISTORY,
+    horizon=HORIZON,
+    main_quantile=CHRONOS_MAIN_QUANTILE,
+    ag_model_path=AG_MODEL_PATH,
+    time_limit=AG_TIME_LIMIT,
+    fine_tune_steps=FINE_TUNE_STEPS,
+    fine_tune_lr=FINE_TUNE_LR,
+)
+
+print("\n" + "=" * 100)
+print("Chronos-2 finished successfully.")
+print("=" * 100)
+print("chronos_pred_df shape:", chronos_pred_df.shape)
+
+try:
+    display(chronos_pred_df.head())
+except Exception:
+    print(chronos_pred_df.head())
+
+
+# ============================================================
+# 8. RUN STEP 2: Chronos 成功后，再跑你的 TCN
+# ============================================================
+
+print("\n" + "=" * 100)
+print("Step 2: Run your original TCN exposure model")
+print("=" * 100)
+
+result_tcn = run_exposure_v2(
+    data_raw1=data_raw1,
+    scot_df=scot_df,
+    n_asins=N_ASINS,
+    seed=SEED,
+    history=HISTORY,
+    horizon=HORIZON,
+    d_model=64,
+    n_heads=4,
+    batch_size=64,
+    epochs=60,
+    lr=1e-3,
+    patience=8,
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=1.00,
+    mag_weight=1.00,
+    mean_weight=0.20,
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+)
+
+pred_df = result_tcn["forecast_df"]
+
+
+# ============================================================
+# 9. RUN STEP 3: 合并比较 Chronos vs TCN
+# ============================================================
+
+print("\n" + "=" * 100)
+print("Step 3: Compare Chronos-2 vs your TCN")
+print("=" * 100)
+
+comparison = compare_instock_chronos_vs_tcn(
+    tcn_pred_df=pred_df,
+    chronos_pred_df=chronos_pred_df,
+    save_path=SAVE_COMPARE_PATH,
+)
+
+compare_df = comparison["compare_df"]
+summary = comparison["summary"]
+by_horizon = comparison["by_horizon"]
+
+result_chronos_instock = {
+    "predictor": chronos_predictor,
+    "chronos_pred_df": chronos_pred_df,
+    "comparison": comparison,
+    "known_covariates_list": known_covariates_list,
+    "chronos_data": chronos_df,
+}
+
+
+# ============================================================
+# 10. Final display
+# ============================================================
 
 print("\n" + "=" * 100)
 print("Final objects created")
 print("=" * 100)
-print("result_tcn                  # your original TCN result, if RUN_TCN_FIRST=True")
+print("chronos_pred_df             # Chronos-2 prediction only")
+print("result_tcn                  # your original TCN result")
 print("pred_df                     # your TCN forecast_df")
 print("result_chronos_instock      # full Chronos-2 result")
-print("chronos_pred_df             # Chronos-2 prediction only")
 print("compare_df                  # merged true / TCN / Chronos comparison")
 print("summary                     # overall metrics")
 print("by_horizon                  # horizon-level metrics")
 
 print("\nsummary:")
-display(summary.round(5))
+try:
+    display(summary.round(5))
+except Exception:
+    print(summary.round(5).to_string(index=False))
 
 print("\nby_horizon:")
-display(by_horizon.round(5))
+try:
+    display(by_horizon.round(5))
+except Exception:
+    print(by_horizon.round(5).to_string(index=False))
 
 print("\ncompare_df sample:")
-display(
-    compare_df[
-        [
-            "asin",
-            "order_week",
-            "horizon",
-            "true_instock_dph",
-            "pred_instock_dph",
-            "chronos_pred_instock_dph",
-            "tcn_abs_err_instock",
-            "chronos_abs_err_instock",
-            "chronos_better",
-        ]
-    ].head(50)
-)
+sample_cols = [
+    "asin",
+    "order_week",
+    "horizon",
+    "true_instock_dph",
+    "pred_instock_dph",
+    "chronos_pred_instock_dph",
+    "tcn_abs_err_instock",
+    "chronos_abs_err_instock",
+    "chronos_better",
+]
+
+try:
+    display(compare_df[sample_cols].head(50))
+except Exception:
+    print(compare_df[sample_cols].head(50).to_string(index=False))
