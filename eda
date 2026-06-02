@@ -1,0 +1,82 @@
+import pandas as pd
+import numpy as np
+
+df = data_raw1.copy()
+df["order_week"] = pd.to_datetime(df["order_week"])
+df["order_month"] = df["order_week"].dt.month
+
+for c in ["in_stock_dph", "total_dph", "buy_box_dph", "fbi_demand"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+
+# ── 1. by-month 均值 ──────────────────────────────────────
+monthly = df.groupby("order_month").agg(
+    mean_instock=("in_stock_dph", "mean"),
+    mean_total=("total_dph", "mean"),
+    mean_demand=("fbi_demand", "mean"),
+    zero_rate_instock=("in_stock_dph", lambda x: (x <= 0).mean()),
+    zero_rate_demand=("fbi_demand", lambda x: (x <= 0).mean()),
+).reset_index()
+
+print("=== BY MONTH ===")
+print(monthly.round(4).to_string(index=False))
+
+# ── 2. DPH和demand的相关性 ───────────────────────────────
+print("\n=== CORRELATION: instock_dph vs demand ===")
+corr_overall = df[["in_stock_dph", "total_dph", "buy_box_dph", "fbi_demand"]].corr()
+print(corr_overall.round(4).to_string())
+
+# ASIN级别的相关性
+asin_corr = df.groupby("asin").apply(
+    lambda g: g["in_stock_dph"].corr(g["fbi_demand"])
+).dropna()
+print(f"\nASIN-level instock vs demand corr:")
+print(f"  median: {asin_corr.median():.4f}")
+print(f"  p25:    {asin_corr.quantile(0.25):.4f}")
+print(f"  p75:    {asin_corr.quantile(0.75):.4f}")
+
+# ── 3. 峰值周分析 ─────────────────────────────────────────
+weekly = df.groupby("order_week").agg(
+    mean_instock=("in_stock_dph", "mean"),
+    mean_demand=("fbi_demand", "mean"),
+    mean_total=("total_dph", "mean"),
+).reset_index()
+
+print("\n=== TOP 10 PEAK WEEKS by instock_dph ===")
+print(weekly.nlargest(10, "mean_instock")[
+    ["order_week", "mean_instock", "mean_demand", "mean_total"]
+].round(3).to_string(index=False))
+
+print("\n=== TOP 10 PEAK WEEKS by demand ===")
+print(weekly.nlargest(10, "mean_demand")[
+    ["order_week", "mean_instock", "mean_demand", "mean_total"]
+].round(3).to_string(index=False))
+
+# ── 4. demand峰值和DPH峰值是否同步 ──────────────────────
+asin_mean_demand = df.groupby("asin")["fbi_demand"].transform("mean")
+asin_mean_instock = df.groupby("asin")["in_stock_dph"].transform("mean")
+
+df["is_demand_peak"] = (df["fbi_demand"] > 2 * asin_mean_demand).astype(int)
+df["is_instock_peak"] = (df["in_stock_dph"] > 2 * asin_mean_instock).astype(int)
+
+# 两个峰值的重合率
+both_peak = (df["is_demand_peak"] & df["is_instock_peak"]).mean()
+demand_peak_only = (df["is_demand_peak"] & ~df["is_instock_peak"]).mean()
+instock_peak_only = (~df["is_demand_peak"] & df["is_instock_peak"]).mean()
+
+print("\n=== PEAK OVERLAP: demand vs instock ===")
+print(f"Both peak:         {both_peak:.4f}")
+print(f"Demand peak only:  {demand_peak_only:.4f}")
+print(f"Instock peak only: {instock_peak_only:.4f}")
+
+# ── 5. demand能否预测下一周的DPH变化 ────────────────────
+# demand领先instock的相关性
+df_sorted = df.sort_values(["asin", "order_week"])
+df_sorted["instock_next_week"] = df_sorted.groupby("asin")["in_stock_dph"].shift(-1)
+lead_corr = df_sorted.groupby("asin").apply(
+    lambda g: g["fbi_demand"].corr(g["instock_next_week"])
+).dropna()
+
+print(f"\n=== DEMAND LEADING INSTOCK (demand→next week instock) ===")
+print(f"  median corr: {lead_corr.median():.4f}")
+print(f"  p25:         {lead_corr.quantile(0.25):.4f}")
+print(f"  p75:         {lead_corr.quantile(0.75):.4f}")
