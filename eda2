@@ -1,0 +1,13 @@
+# 去年同期demand能预测今年DPH吗？
+# 这是你的半AR锚点设计的关键
+df_sorted = df.sort_values(["asin", "order_week"])
+df_sorted["demand_same_week_last_year"] = df_sorted.groupby("asin")["fbi_demand"].shift(52)
+
+yoy_corr = df_sorted.groupby("asin").apply(
+    lambda g: g["in_stock_dph"].corr(g["demand_same_week_last_year"])
+).dropna()
+
+print(f"YoY demand → instock corr:")
+print(f"  median: {yoy_corr.median():.4f}")
+print(f"  p25:    {yoy_corr.quantile(0.25):.4f}")
+print(f"  p75:    {yoy_corr.quantile(0.75):.4f}")
