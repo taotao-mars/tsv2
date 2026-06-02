@@ -1,13 +1,88 @@
-# 去年同期demand能预测今年DPH吗？
-# 这是你的半AR锚点设计的关键
-df_sorted = df.sort_values(["asin", "order_week"])
-df_sorted["demand_same_week_last_year"] = df_sorted.groupby("asin")["fbi_demand"].shift(52)
+import pandas as pd
+import numpy as np
 
-yoy_corr = df_sorted.groupby("asin").apply(
-    lambda g: g["in_stock_dph"].corr(g["demand_same_week_last_year"])
-).dropna()
+df = data_raw1.copy()
+df["order_week"] = pd.to_datetime(df["order_week"])
 
-print(f"YoY demand → instock corr:")
-print(f"  median: {yoy_corr.median():.4f}")
-print(f"  p25:    {yoy_corr.quantile(0.25):.4f}")
-print(f"  p75:    {yoy_corr.quantile(0.75):.4f}")
+for c in ["in_stock_dph", "total_dph", "fbi_demand", "our_price", 
+          "list_price", "hb_rank", "customer_active_review_count",
+          "customer_review_count"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+
+# ── 1. ind_promotion：是静态还是随时间变化？────────────────
+print("=== ind_promotion: 时序变化性 ===")
+if "ind_promotion" in df.columns:
+    promo_change = df.groupby("asin")["ind_promotion"].nunique()
+    print(f"ASIN中ind_promotion从不变化的比例: {(promo_change==1).mean():.3f}")
+    print(f"ASIN中ind_promotion有变化的比例:   {(promo_change>1).mean():.3f}")
+    print(f"全局promotion率: {df['ind_promotion'].mean():.3f}")
+
+# ── 2. hbt：honeymoon period，是短期还是长期？───────────────
+print("\n=== hbt: 持续时间分析 ===")
+if "hbt" in df.columns:
+    df["hbt"] = pd.to_numeric(df["hbt"], errors="coerce").fillna(0)
+    hbt_duration = df[df["hbt"] > 0].groupby("asin")["order_week"].nunique()
+    print(f"hbt>0的ASIN比例: {(df.groupby('asin')['hbt'].max() > 0).mean():.3f}")
+    print(f"hbt持续周数 median: {hbt_duration.median():.1f}")
+    print(f"hbt持续周数 p75:    {hbt_duration.quantile(0.75):.1f}")
+    print(f"hbt持续周数 p90:    {hbt_duration.quantile(0.90):.1f}")
+
+# ── 3. glance_view_band_cat：和DPH的关系────────────────────
+print("\n=== glance_view_band_cat vs in_stock_dph ===")
+if "glance_view_band_cat" in df.columns:
+    gv = df.groupby("glance_view_band_cat").agg(
+        n=("asin", "count"),
+        mean_instock=("in_stock_dph", "mean"),
+        mean_demand=("fbi_demand", "mean"),
+        zero_rate=("in_stock_dph", lambda x: (x<=0).mean()),
+    ).reset_index().sort_values("mean_instock", ascending=False)
+    print(gv.round(3).to_string(index=False))
+
+# ── 4. price和DPH/demand ratio的关系（验证你的假设）─────────
+print("\n=== PRICE vs DPH/DEMAND RATIO ===")
+asin_stats = df.groupby("asin").agg(
+    mean_instock=("in_stock_dph", "mean"),
+    mean_demand=("fbi_demand", "mean"),
+    mean_price=("our_price", "mean"),
+    gl=("gl_product_group", "first"),
+).reset_index()
+asin_stats["dph_demand_ratio"] = (
+    asin_stats["mean_instock"] / (asin_stats["mean_demand"] + 1e-8)
+)
+price_q = asin_stats["mean_price"].clip(
+    upper=asin_stats["mean_price"].quantile(0.99)
+)
+ratio_q = asin_stats["dph_demand_ratio"].clip(
+    upper=asin_stats["dph_demand_ratio"].quantile(0.99)
+)
+corr = price_q.corr(ratio_q, method="spearman")
+print(f"Spearman corr price vs dph/demand ratio: {corr:.4f}")
+
+asin_stats["price_group"] = pd.qcut(
+    price_q.rank(method="first"), q=4,
+    labels=["low","mid","high","premium"]
+)
+pg = asin_stats.groupby("price_group", observed=True).agg(
+    n=("asin","count"),
+    median_price=("mean_price","median"),
+    median_ratio=("dph_demand_ratio","median"),
+    median_instock=("mean_instock","median"),
+).reset_index()
+print(pg.round(3).to_string(index=False))
+
+# ── 5. sort_type和ind_amxl_hb：分布和DPH关系───────────────
+print("\n=== sort_type vs in_stock_dph ===")
+if "sort_type" in df.columns:
+    st = df.groupby("sort_type").agg(
+        n=("asin","count"),
+        mean_instock=("in_stock_dph","mean"),
+        mean_demand=("fbi_demand","mean"),
+    ).reset_index().sort_values("mean_instock",ascending=False)
+    print(st.head(10).round(3).to_string(index=False))
+
+print("\n=== ind_amxl_hb vs in_stock_dph ===")
+if "ind_amxl_hb" in df.columns:
+    ah = df.groupby("ind_amxl_hb").agg(
+        n=("asin","count"),
+        mean_instock=("in_stock_dph","mean"),
