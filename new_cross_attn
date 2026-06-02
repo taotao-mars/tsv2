@@ -270,6 +270,9 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
             "hist_total_dph_last_log",   "hist_total_dph_mean4_log",   "hist_total_dph_mean13_log",
             "hist_buy_box_dph_last_log", "hist_buy_box_dph_mean4_log", "hist_buy_box_dph_mean13_log",
             "hist_instock_dph_last_log", "hist_instock_dph_mean4_log", "hist_instock_dph_mean13_log",
+            # demand历史anchor：EDA显示demand领先instock corr=0.676
+            "hist_demand_last_log", "hist_demand_mean4_log", "hist_demand_mean13_log",
+            "hist_demand_active_rate",
         ]
     ))
 
@@ -361,26 +364,74 @@ class ExposureDataset(Dataset):
         total   = d["total_dph"]
         buy     = d["buy_box_dph"]
         instock = d["in_stock_dph"]
+        demand  = d["demand"]   # 新增
 
-        # ── 核心改动：anchor随horizon指数衰减向长期均值收缩 ──────
-        # h=0（预测第1周）时完全信任last，h=19时大量依赖mean13
-        # decay = exp(-k * step_h)，k=0.08时h=20时decay≈0.2
+        # ── anchor随horizon衰减 + post_event校正 ──────────────
+        # 两层校正：
+        #   1. horizon decay：随h增大向mean13收缩（已有）
+        #   2. post_event decay：如果历史末尾是节假日峰值，
+        #      对last_val做校正，避免把峰值传播到所有h的anchor
+
+        # 从future_context里读post_event_decay（第一个h的值，代表当前时刻的节假日位置）
+        # post_event_decay在context_cols里，h=0时的值反映"历史末尾距节假日多远"
+        post_event_col = "post_event_decay"
+        if post_event_col in idx:
+            # 用预测起始时刻（h=0）的post_event_decay校正last_val
+            # 节假日刚过（decay≈1）→ last_val可信；节假日过了很久（decay≈0）→ last_val不可信
+            current_post_decay = float(fc[0, idx[post_event_col]])
+        else:
+            current_post_decay = 1.0  # 没有这个特征就不校正
+
         for step_h in range(H):
-            decay = np.exp(-self.anchor_decay * step_h)
+            # horizon decay：越远越收缩到mean13
+            h_decay = np.exp(-self.anchor_decay * step_h)
 
             for prefix, arr in [("total", total), ("buy_box", buy), ("instock", instock)]:
-                last_val   = np.log1p(arr[end - 1]) if end > 0 else 0.0
-                mean4_val  = np.log1p(self._hist_mean(arr, end, 4))
                 mean13_val = np.log1p(self._hist_mean(arr, end, 13))
+                mean4_val  = np.log1p(self._hist_mean(arr, end, 4))
+                raw_last   = np.log1p(arr[end - 1]) if end > 0 else 0.0
+
+                # post_event校正：节假日后的峰值向mean13收缩
+                # current_post_decay≈1（刚过节假日）→ last_val被大幅校正
+                # current_post_decay≈0（很久以前的节假日）→ last_val基本不变
+                # 校正公式：corrected = last * (1-post_decay) + mean13 * post_decay
+                # 注意：post_decay越大说明越靠近节假日，此时反而需要校正
+                # 感恩节后1周: post_decay≈0.86 → last_val被压向mean13
+                # 正常周:       post_decay≈0.05 → last_val基本不变
+                last_val = (
+                    raw_last * (1.0 - current_post_decay)
+                    + mean13_val * current_post_decay
+                )
 
                 key_map = {
-                    f"hist_{prefix}_dph_last_log":   decay * last_val   + (1 - decay) * mean13_val,
-                    f"hist_{prefix}_dph_mean4_log":  decay * mean4_val  + (1 - decay) * mean13_val,
-                    f"hist_{prefix}_dph_mean13_log": mean13_val,  # mean13不衰减，作为稳定锚点
+                    f"hist_{prefix}_dph_last_log":   h_decay * last_val  + (1 - h_decay) * mean13_val,
+                    f"hist_{prefix}_dph_mean4_log":  h_decay * mean4_val + (1 - h_decay) * mean13_val,
+                    f"hist_{prefix}_dph_mean13_log": mean13_val,
                 }
                 for col, val in key_map.items():
                     if col in idx:
                         fc[step_h, idx[col]] = val
+
+        # ── demand anchor（所有h用同一个历史值，demand无需decay）──
+        # EDA显示demand领先instock corr=0.676，加入作为近期活跃信号
+        # demand没有节假日峰值校正的问题（demand本身就是真实信号）
+        demand_last   = np.log1p(demand[end - 1]) if end > 0 else 0.0
+        demand_mean4  = np.log1p(self._hist_mean(demand, end, 4))
+        demand_mean13 = np.log1p(self._hist_mean(demand, end, 13))
+        demand_active_rate = float(np.mean(demand[max(0, end-13):end] > 0)) if end > 0 else 0.0
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            # demand anchor也随h衰减（近期更可信）
+            demand_anchor = h_decay * demand_last + (1 - h_decay) * demand_mean13
+            for col, val in [
+                ("hist_demand_last_log",    demand_anchor),
+                ("hist_demand_mean4_log",   h_decay * demand_mean4  + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean13_log",  demand_mean13),
+                ("hist_demand_active_rate", demand_active_rate),
+            ]:
+                if col in idx:
+                    fc[step_h, idx[col]] = val
 
         return fc
 
@@ -915,16 +966,131 @@ def print_exposure_diagnostics(pred_df):
         y = g["true_instock_dph"].values
         p = g["pred_instock_dph"].values
         rows.append({
-            "horizon":   h,
-            "true_mean": np.mean(y),
-            "pred_mean": np.mean(p),
-            "ratio":     np.mean(p) / (np.mean(y) + 1e-8),
-            "WAPE":      _wape(y, p),
-            "corr":      _corr(y, p),
+            "horizon":    h,
+            "true_mean":  np.mean(y),
+            "pred_mean":  np.mean(p),
+            "ratio":      np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE":       _wape(y, p),
+            "underbias":  np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias":   np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr":       _corr(y, p),
             "active_AUC": _auc((y > 0).astype(int), p),
         })
     by_h = pd.DataFrame(rows)
-    print(by_h.round(5).to_string(index=False))
+    print(by_h.round(4).to_string(index=False))
+
+    # ── naive baseline 对比 ───────────────────────────────────
+    naive_cols = {
+        "naive_last":   "pred_instock_dph_last",
+        "naive_mean4":  "pred_instock_dph_mean4",
+        "naive_mean13": "pred_instock_dph_mean13",
+    }
+    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+
+    if available_naive:
+        print("\n" + "=" * 100)
+        print("MODEL VS NAIVE: IN_STOCK_DPH (overall)")
+        print("=" * 100)
+        comp_rows = []
+        y_all = pred_df["true_instock_dph"].values
+        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+            if col not in pred_df.columns:
+                continue
+            p_all = pred_df[col].values
+            comp_rows.append({
+                "method":     name,
+                "ratio":      np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE":       _wape(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "corr":       _corr(y_all, p_all),
+            })
+        print(pd.DataFrame(comp_rows).round(4).to_string(index=False))
+
+        print("\n" + "=" * 100)
+        print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
+        print("=" * 100)
+        pred_df["_block"] = pd.cut(
+            pred_df["horizon"],
+            bins=[0, 5, 12, 20],
+            labels=["short_1_5", "mid_6_12", "long_13_20"],
+        )
+        block_rows = []
+        for block, g in pred_df.groupby("_block", observed=True):
+            y_b = g["true_instock_dph"].values
+            for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+                if col not in g.columns:
+                    continue
+                p_b = g[col].values
+                block_rows.append({
+                    "block":      block,
+                    "method":     name,
+                    "ratio":      np.mean(p_b) / (np.mean(y_b) + 1e-8),
+                    "WAPE":       _wape(y_b, p_b),
+                    "active_AUC": _auc((y_b > 0).astype(int), p_b),
+                    "corr":       _corr(y_b, p_b),
+                })
+        print(pd.DataFrame(block_rows).round(4).to_string(index=False))
+        pred_df.drop(columns=["_block"], inplace=True, errors="ignore")
+
+    # ── p_active诊断 ─────────────────────────────────────────
+    p_active_cols = [c for c in ["p_active_total", "p_active_buy_box", "p_active_instock"]
+                     if c in pred_df.columns]
+    if p_active_cols:
+        print("\n" + "=" * 100)
+        print("P_ACTIVE BY HORIZON (should NOT be monotonically increasing)")
+        print("=" * 100)
+        pa_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            for c in p_active_cols:
+                row[c] = g[c].mean()
+            # 和真实active rate对比
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            pa_rows.append(row)
+        pa_df = pd.DataFrame(pa_rows)
+        print(pa_df.round(4).to_string(index=False))
+
+        # 快速判断
+        pa_instock = pa_df["p_active_instock"].values if "p_active_instock" in pa_df.columns else None
+        if pa_instock is not None:
+            is_monotone = all(pa_instock[i] <= pa_instock[i+1] for i in range(len(pa_instock)-1))
+            print(f"\np_active_instock monotonically increasing: {is_monotone}")
+            if is_monotone:
+                print("  ⚠️  Still monotone — BCE may still be too strong")
+            else:
+                print("  ✅  Not monotone — BCE is calibrated correctly")
+
+    # ── ASIN级别诊断 ─────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("ASIN-LEVEL 20-WEEK SUM")
+    print("=" * 100)
+    asin_sum = pred_df.groupby("asin").agg(
+        true_sum=("true_instock_dph", "sum"),
+        pred_sum=("pred_instock_dph", "sum"),
+    ).reset_index()
+    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
+    asin_sum["wape"]  = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
+    print(f"ASIN-sum Spearman: {_safe_spearman(asin_sum['true_sum'], asin_sum['pred_sum']):.4f}")
+    print(f"Median ASIN ratio: {asin_sum['ratio'].median():.4f}")
+    print(f"Median ASIN WAPE:  {asin_sum['wape'].median():.4f}")
+    print(f"p90 ASIN WAPE:     {asin_sum['wape'].quantile(0.90):.4f}")
+
+    # ── 快速判断总结 ──────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("QUICK JUDGMENT")
+    print("=" * 100)
+    h1  = by_h[by_h["horizon"] == 1].iloc[0]
+    h20 = by_h[by_h["horizon"] == 20].iloc[0]
+    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
+    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
+    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
+    ratio_ok  = 0.85 <= h20["ratio"] <= 1.15
+    auc_ok    = h20["active_AUC"] >= 0.70
+    drop_ok   = (h1["active_AUC"] - h20["active_AUC"]) < 0.20
+    print(f"\nh=20 ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
+    print(f"h=20 AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
+    print(f"AUC drop < 0.20:           {'✅' if drop_ok else '❌'}")
+
     return {"model": model_tbl, "by_horizon": by_h}
 
 
