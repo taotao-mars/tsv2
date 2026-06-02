@@ -86,3 +86,27 @@ if "ind_amxl_hb" in df.columns:
     ah = df.groupby("ind_amxl_hb").agg(
         n=("asin","count"),
         mean_instock=("in_stock_dph","mean"),
+        mean_demand=("fbi_demand","mean"),
+        mean_price=("our_price","mean"),
+    ).reset_index().sort_values("mean_instock",ascending=False)
+    print(ah.round(3).to_string(index=False))
+
+# ── 6. customer_active_review_count：log变换后和DPH的相关性─
+print("\n=== review_count vs in_stock_dph ===")
+if "customer_active_review_count" in df.columns:
+    df["log_review"] = np.log1p(df["customer_active_review_count"])
+    corr_review = df[["log_review","in_stock_dph"]].corr(method="spearman")
+    print(f"log(review_count) vs instock_dph Spearman: {corr_review.iloc[0,1]:.4f}")
+    
+    # review count分组
+    df["review_group"] = pd.qcut(
+        df["log_review"].rank(method="first"), q=4,
+        labels=["low","mid","high","top"]
+    )
+    rg = df.groupby("review_group", observed=True).agg(
+        n=("asin","count"),
+        mean_instock=("in_stock_dph","mean"),
+        mean_demand=("fbi_demand","mean"),
+        zero_rate=("in_stock_dph", lambda x: (x<=0).mean()),
+    ).reset_index()
+    print(rg.round(3).to_string(index=False))
