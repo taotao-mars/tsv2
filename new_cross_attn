@@ -469,17 +469,26 @@ class HorizonTCNBlock(nn.Module):
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
-    TCN Decoder + Cross-Attention。
+    TCN Decoder + Cross-Attention + Anchor残差预测。
 
     Q = decoder TCN输出 [B, H, D]
     K = V = encoder全序列 [B, T, D]
 
-    每个horizon h 可以自由attend到52周历史中的任意位置。
+    改动：mag_head预测相对于mean13 anchor的残差，不是直接预测绝对值。
+    模型学的是"在历史均值基础上调整多少"。
+    远期h的anchor已经通过decay向mean13收缩，残差自然趋近于0。
+
+    anchor_indices: context_cols里三个mean13的index
+        [total_mean13_idx, buy_mean13_idx, instock_mean13_idx]
     """
     def __init__(self, d_model, context_dim, horizon=20,
-                 hidden=96, n_heads=4, dropout=0.10):
+                 hidden=96, n_heads=4, dropout=0.10,
+                 anchor_indices=None):
         super().__init__()
         self.horizon = horizon
+        # anchor_indices: [total_idx, buy_idx, instock_idx]
+        # 如果为None则不用残差预测（向后兼容）
+        self.anchor_indices = anchor_indices
 
         # future_context + horizon位置编码 → hidden
         self.input_proj = nn.Sequential(
@@ -496,32 +505,38 @@ class TCNDecoderWithCrossAttn(nn.Module):
         ])
 
         # 投影到d_model做cross-attention
-        self.dec_proj    = nn.Linear(hidden, d_model)
+        self.dec_proj   = nn.Linear(hidden, d_model)
 
         # Cross-Attention
-        self.cross_attn  = nn.MultiheadAttention(
+        self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.post_norm   = nn.LayerNorm(d_model)
+        self.post_norm  = nn.LayerNorm(d_model)
 
         # ── Hurdle双头输出 ────────────────────────────────────
         # active_head: 这周有没有曝光？ → BCE
-        # mag_head:    有曝光时值是多少？ → Huber（只在active周）
         self.active_head = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 3),   # logit，forward里sigmoid
+            nn.Linear(hidden, 3),
         )
+
+        # mag_head: 预测相对于anchor的残差
+        # 输出tanh*scale → 允许正负调整，不允许无限大
+        # anchor + residual → 最终magnitude
         self.mag_head = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 3),   # softplus → log level
+            nn.Linear(hidden, 3),
+            nn.Tanh(),   # 输出在(-1, 1)之间
         )
+        # 残差的缩放系数：允许最多上下调整anchor的这个倍数
+        self.residual_scale = 2.0
 
     def forward(self, enc_out, future_context, return_aux=False):
         # enc_out:        [B, 52, D]
@@ -553,13 +568,35 @@ class TCNDecoderWithCrossAttn(nn.Module):
 
         z_out = self.post_norm(q + attn_out)   # [B,H,D]
 
-        # Hurdle输出
-        active_logit = self.active_head(z_out)             # [B,H,3]
-        p_active     = torch.sigmoid(active_logit)         # [B,H,3] ∈ (0,1)
-        log_mag      = F.softplus(self.mag_head(z_out))    # [B,H,3] > 0
+        # ── Hurdle active head ────────────────────────────────
+        active_logit = self.active_head(z_out)         # [B,H,3]
+        p_active     = torch.sigmoid(active_logit)     # [B,H,3]
+
+        # ── Anchor残差magnitude head ──────────────────────────
+        residual = self.mag_head(z_out)                # [B,H,3] ∈ (-1,1)
+
+        if self.anchor_indices is not None:
+            # 从future_context取三个mean13 anchor值
+            # anchor已经在_make_future_context里加了decay，越远越接近mean13
+            ti, bi, ii = self.anchor_indices
+            anchor = torch.stack([
+                future_context[:, :, ti],   # total_mean13   [B,H]
+                future_context[:, :, bi],   # buy_mean13     [B,H]
+                future_context[:, :, ii],   # instock_mean13 [B,H]
+            ], dim=-1)                      # [B,H,3]
+
+            # log_mag = anchor + residual * scale
+            # anchor是log1p空间的值，residual是相对调整
+            # scale控制最大调整幅度
+            log_mag = F.softplus(
+                anchor + residual * self.residual_scale
+            )   # [B,H,3] > 0
+        else:
+            # 向后兼容：没有anchor就直接用softplus
+            log_mag = F.softplus(residual * self.residual_scale)
 
         # 最终预测 = occurrence × magnitude
-        log_hat = p_active * log_mag                        # [B,H,3]
+        log_hat = p_active * log_mag   # [B,H,3]
 
         if return_aux:
             return {
@@ -567,6 +604,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "active_logit": active_logit,
                 "p_active":     p_active,
                 "log_mag":      log_mag,
+                "residual":     residual,
                 "attn_weights": attn_w,
             }
         return log_hat
@@ -577,14 +615,31 @@ class ExposureForecastModelV2(nn.Module):
     入口与原 ExposureForecastModel 完全相同：
         forward(x, future_context) → log_hat [B, H, 3]
 
-    内部改动：
-        Encoder: 全序列输出 [B,52,D]（原来是 [B,D]）
-        Decoder: TCN + Cross-Attention + Hurdle双头
+    改动：
+        Encoder: 全序列输出 [B,52,D]
+        Decoder: TCN + Cross-Attention + Hurdle双头 + Anchor残差预测
+        anchor_indices 在初始化时从context_cols里查找并传入decoder
     """
     def __init__(self, input_dim, context_dim,
-                 d_model=64, horizon=20, n_heads=4, dropout=0.10):
+                 d_model=64, horizon=20, n_heads=4, dropout=0.10,
+                 context_cols=None):
         super().__init__()
         self.encoder = HistoryEncoderFull(input_dim=input_dim, d_model=d_model)
+
+        # 从context_cols里找mean13的index
+        anchor_indices = None
+        if context_cols is not None:
+            col_idx = {c: i for i, c in enumerate(context_cols)}
+            try:
+                anchor_indices = [
+                    col_idx["hist_total_dph_mean13_log"],
+                    col_idx["hist_buy_box_dph_mean13_log"],
+                    col_idx["hist_instock_dph_mean13_log"],
+                ]
+                print(f"Anchor indices (mean13): {anchor_indices}")
+            except KeyError as e:
+                print(f"Warning: anchor column not found: {e}, 残差预测disabled")
+
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
             context_dim=context_dim,
@@ -592,10 +647,11 @@ class ExposureForecastModelV2(nn.Module):
             hidden=max(96, d_model * 2),
             n_heads=n_heads,
             dropout=dropout,
+            anchor_indices=anchor_indices,
         )
 
     def forward(self, x, future_context, return_aux=False):
-        enc_out = self.encoder(x)                              # [B, 52, D]
+        enc_out = self.encoder(x)
         return self.decoder(enc_out, future_context, return_aux=return_aux)
 
 
@@ -643,9 +699,16 @@ def exposure_hurdle_loss(
 
     # ── Loss 1: BCE（occurrence）─────────────────────────────
     active_label = (true > 0).float()
-    bce = F.binary_cross_entropy_with_logits(
+
+    # pos_weight < 1 降低对active预测的奖励，压制overbias
+    # p_active单调递增说明BCE把模型推得太aggressive
+    pos_w = torch.tensor([0.6, 0.6, 0.6],
+                          dtype=log_hat.dtype,
+                          device=log_hat.device).view(1, 1, 3)
+    bce_raw = F.binary_cross_entropy_with_logits(
         active_logit, active_label, reduction="none"
     )
+    bce = bce_raw * (1.0 - active_label) + bce_raw * active_label * pos_w
     bce_loss = (bce * sample_w * tw).mean()
 
     # ── Loss 2: Magnitude Huber（只在active周）───────────────
@@ -895,9 +958,9 @@ def run_exposure_v2(
     extreme_q=0.99,
     apply_funnel_constraint=True,
     anchor_decay=0.08,
-    bce_weight=1.00,
-    mag_weight=1.00,
-    mean_weight=0.20,
+    bce_weight=0.30,
+    mag_weight=1.50,
+    mean_weight=0.30,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
 ):
@@ -930,6 +993,7 @@ def run_exposure_v2(
         horizon=horizon,
         n_heads=n_heads,
         dropout=0.10,
+        context_cols=context_cols,   # ← 传入context_cols，让模型找到mean13的index
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
