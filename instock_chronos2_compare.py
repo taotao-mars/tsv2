@@ -1549,10 +1549,13 @@ def run_full_chronos_tcn_experiment(
     }
 
 
-USAGE = r
-# ===================== RUN CONFIG =====================
+
+# ===================== USAGE / RUN CONFIG =====================
 # Paste/run this file after data_raw1 and scot_df exist.
-# Change only these values if needed.
+# In Jupyter, you can run:
+#   %run -i full_chronos2_tcn_instock_swapped_features.py
+# It will automatically run the experiment if RUN_EXPERIMENT_NOW=True.
+
 RUN_EXPERIMENT_NOW = True
 
 N_ASINS = 5000
@@ -1560,12 +1563,46 @@ SEED = 42
 HISTORY = 52
 HORIZON = 20
 
-CHRONOS_MAIN_QUANTILE = "0.5"   # "0.5"=p50, "0.7"=p70
-USE_GLANCE_VIEW_COUNT = True     # past-only, no future leakage
+CHRONOS_MAIN_QUANTILE = "0.5"   # "0.5" = p50, "0.7" = p70
+USE_GLANCE_VIEW_COUNT = True     # used only as past covariate, not future
 
 CHRONOS_TIME_LIMIT = 14400
 FINE_TUNE_STEPS = 2000
 FINE_TUNE_LR = 1e-6
+
+AG_MODEL_PATH = "AutogluonModels/ag_InStockDPH_Chronos2_FineTuned"
+SAVE_COMPARE_PATH = "chronos2_instock_compare_df.parquet"
+
+
+def print_usage():
+    print("""
+USAGE:
+1) Make sure data_raw1 and scot_df already exist in your notebook.
+2) Run this file in Jupyter:
+
+   %run -i full_chronos2_tcn_instock_swapped_features.py
+
+3) Outputs created:
+   result
+   summary
+   by_horizon
+   compare_df
+   chronos_pred_df
+   pred_df
+
+4) Main config near the bottom of this file:
+   N_ASINS = 5000
+   CHRONOS_MAIN_QUANTILE = "0.5"   # change to "0.7" for p70
+   USE_GLANCE_VIEW_COUNT = True
+   FINE_TUNE_STEPS = 2000
+   CHRONOS_TIME_LIMIT = 14400
+
+5) View results:
+   display(summary.round(5))
+   display(by_horizon.round(5))
+   display(compare_df.head(50))
+""")
+
 
 if RUN_EXPERIMENT_NOW:
     result = run_full_chronos_tcn_experiment(
@@ -1580,6 +1617,8 @@ if RUN_EXPERIMENT_NOW:
         fine_tune_lr=FINE_TUNE_LR,
         chronos_main_quantile=CHRONOS_MAIN_QUANTILE,
         use_glance_view_count=USE_GLANCE_VIEW_COUNT,
+        ag_model_path=AG_MODEL_PATH,
+        save_compare_path=SAVE_COMPARE_PATH,
     )
 
     summary = result["summary"]
@@ -1600,3 +1639,5 @@ if RUN_EXPERIMENT_NOW:
         print(summary.round(5).to_string(index=False))
         print(by_horizon.round(5).to_string(index=False))
         print(compare_df.head(50).to_string(index=False))
+else:
+    print_usage()
