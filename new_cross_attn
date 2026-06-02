@@ -111,8 +111,21 @@ def filter_extreme_asins(data_raw, q=0.99):
 
 
 def _encode_static_features(df):
+    """
+    Static ASIN-level features encoding.
+
+    新增：
+      glance_view_band_cat → /6 归一化（值1-6，完全静态）
+      hbt                  → head=1 / body=0
+      ind_amxl_hb          → binary，直接用
+      sort_type            → /3 归一化
+      ind_new_asin         → binary，直接用
+      ind_amxl_hb          → binary
+    """
     df = df.copy()
     out_cols = []
+
+    # ── 原有：gl_product_group / ind_top10_brand ──────────────
     for c in ["gl_product_group", "ind_top10_brand"]:
         if c not in df.columns:
             continue
@@ -123,6 +136,39 @@ def _encode_static_features(df):
         freq = raw.value_counts(normalize=True)
         df[f"stock_static__{c}__freq"] = raw.map(freq).fillna(0.0).astype(float)
         out_cols.extend([f"stock_static__{c}__code", f"stock_static__{c}__freq"])
+
+    # ── 新增：glance_view_band_cat（值1-6，静态）─────────────
+    if "glance_view_band_cat" in df.columns:
+        gv = _safe_numeric(df["glance_view_band_cat"]).clip(1, 6)
+        df["stock_static__glance_view_band__norm"] = gv / 6.0
+        out_cols.append("stock_static__glance_view_band__norm")
+
+    # ── 新增：hbt（head=1 / body=0，静态）────────────────────
+    if "hbt" in df.columns:
+        df["stock_static__hbt__is_head"] = (
+            df["hbt"].astype(str).str.lower().str.strip() == "head"
+        ).astype(float)
+        out_cols.append("stock_static__hbt__is_head")
+
+    # ── 新增：ind_amxl_hb（binary，静态）─────────────────────
+    if "ind_amxl_hb" in df.columns:
+        df["stock_static__ind_amxl_hb"] = _safe_numeric(df["ind_amxl_hb"]).clip(0, 1)
+        out_cols.append("stock_static__ind_amxl_hb")
+
+    # ── 新增：sort_type（1/2/3，静态）────────────────────────
+    if "sort_type" in df.columns:
+        df["stock_static__sort_type__norm"] = (
+            _safe_numeric(df["sort_type"]).clip(1, 3) / 3.0
+        )
+        out_cols.append("stock_static__sort_type__norm")
+
+    # ── 新增：ind_new_asin（binary，静态）────────────────────
+    if "ind_new_asin" in df.columns:
+        df["stock_static__ind_new_asin"] = _safe_numeric(
+            df["ind_new_asin"]
+        ).clip(0, 1)
+        out_cols.append("stock_static__ind_new_asin")
+
     return df, out_cols
 
 
@@ -242,6 +288,35 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
     df["our_price"] = _safe_numeric(df.get("our_price", 0.0)).clip(lower=0.0)
     df["scot_oos"]  = _safe_numeric(df.get("scot_oos",  0.0)).clip(0, 1)
 
+    # ── 新增动态特征 ──────────────────────────────────────────
+    # ind_promotion：动态binary，99.1% ASIN有变化，进active_head
+    if "ind_promotion" in df.columns:
+        df["ind_promotion"] = _safe_numeric(df["ind_promotion"]).clip(0, 1)
+    else:
+        df["ind_promotion"] = 0.0
+
+    # ind_prime_week：动态binary，3.7%是PrimeDay周，进active_head
+    if "ind_prime_week" in df.columns:
+        df["ind_prime_week"] = _safe_numeric(df["ind_prime_week"]).clip(0, 1)
+    else:
+        df["ind_prime_week"] = 0.0
+
+    # customer_active_review_count：动态，极度右偏，log变换后进mag_head
+    if "customer_active_review_count" in df.columns:
+        df["log_review_count"] = np.log1p(
+            _safe_numeric(df["customer_active_review_count"]).clip(lower=0.0)
+        )
+    else:
+        df["log_review_count"] = 0.0
+
+    # ── 全局price log变换（修复：原来是per-ASIN归一化，丢失跨ASIN信息）
+    # raw skew=19.6，log1p之后skew=-0.046，分布完美正态
+    global_price_log = np.log1p(df["our_price"])
+    # 全局标准化保留价格水平信息
+    price_mean = global_price_log.mean()
+    price_std  = global_price_log.std() + 1e-8
+    df["our_price_log_norm"] = (global_price_log - price_mean) / price_std
+
     df["order_month"]  = df["order_week"].dt.month.astype(float)
     df["month_sin"]    = np.sin(2 * np.pi * df["order_month"] / 12.0)
     df["month_cos"]    = np.cos(2 * np.pi * df["order_month"] / 12.0)
@@ -259,18 +334,21 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         df[c] = _safe_numeric(df[c])
 
     context_cols = list(dict.fromkeys(
-        ["our_price"]
+        # ── 动态特征（时间驱动，进active_head）──────────────
+        ["ind_promotion", "ind_prime_week"]
         + holiday_cols
         + distance_cols
         + explicit_event_cols
         + ["order_month", "month_sin", "month_cos",
            "season_winter", "season_spring", "season_summer", "season_fall"]
+        # ── 商品特征（进mag_head）────────────────────────────
+        + ["our_price_log_norm", "log_review_count"]
         + static_cols
+        # ── 历史anchor──────────────────────────────────────
         + [
             "hist_total_dph_last_log",   "hist_total_dph_mean4_log",   "hist_total_dph_mean13_log",
             "hist_buy_box_dph_last_log", "hist_buy_box_dph_mean4_log", "hist_buy_box_dph_mean13_log",
             "hist_instock_dph_last_log", "hist_instock_dph_mean4_log", "hist_instock_dph_mean13_log",
-            # demand历史anchor：EDA显示demand领先instock corr=0.676
             "hist_demand_last_log", "hist_demand_mean4_log", "hist_demand_mean13_log",
             "hist_demand_active_rate",
         ]
@@ -287,37 +365,40 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         total   = g["total_dph"].values.astype(np.float32)
         buy     = g["buy_box_dph"].values.astype(np.float32)
         instock = g["in_stock_dph"].values.astype(np.float32)
-        price   = g["our_price"].values.astype(np.float32)
         oos     = g["scot_oos"].values.astype(np.float32)
 
+        # ── price改成全局log归一化（不再per-ASIN归一化）────
+        price_log_norm = g["our_price_log_norm"].values.astype(np.float32)
+
+        # ── encoder历史特征（9维→11维）─────────────────────
+        # 新增：log_review_count（mag信号）, ind_promotion（active信号）
         week_idx = np.arange(len(g))
         features = np.stack([
-            np.log1p(demand),
-            (demand > 0).astype(float),
-            np.log1p(total),
-            np.log1p(buy),
-            np.log1p(instock),
-            price,
-            oos,
-            np.sin(2 * np.pi * week_idx / 52.0),
+            np.log1p(demand),                          # 历史需求
+            (demand > 0).astype(float),                # 需求active
+            np.log1p(total),                           # 历史total_dph
+            np.log1p(buy),                             # 历史buy_box_dph
+            np.log1p(instock),                         # 历史instock_dph
+            price_log_norm,                            # 全局log归一化价格
+            oos,                                       # 缺货信号
+            np.sin(2 * np.pi * week_idx / 52.0),      # 年内周期
             np.cos(2 * np.pi * week_idx / 52.0),
+            g["log_review_count"].values.astype(np.float32),   # 新增：评论数
+            g["ind_promotion"].values.astype(np.float32),      # 新增：促销标记
         ], axis=1).astype(np.float32)
 
-        if np.std(features[:, 5]) > 1e-8:
-            features[:, 5] = (features[:, 5] - features[:, 5].mean()) / (features[:, 5].std() + 1e-8)
-
         data[asin] = {
-            "week": g["order_week"].values,
-            "features": features,
-            "demand": demand,
-            "total_dph": total,
-            "buy_box_dph": buy,
-            "in_stock_dph": instock,
+            "week":           g["order_week"].values,
+            "features":       features,
+            "demand":         demand,
+            "total_dph":      total,
+            "buy_box_dph":    buy,
+            "in_stock_dph":   instock,
             "future_context": g[context_cols].values.astype(np.float32),
-            "context_cols": context_cols,
+            "context_cols":   context_cols,
         }
 
-    print(f"ASINs: {len(data)} | Context dim: {len(context_cols)}")
+    print(f"ASINs: {len(data)} | Context dim: {len(context_cols)} | Encoder dim: 11")
     return data, len(context_cols), context_cols
 
 
@@ -520,26 +601,32 @@ class HorizonTCNBlock(nn.Module):
 
 class TCNDecoderWithCrossAttn(nn.Module):
     """
-    TCN Decoder + Cross-Attention + Anchor残差预测。
+    TCN Decoder + Cross-Attention + 分离双Head。
 
-    Q = decoder TCN输出 [B, H, D]
-    K = V = encoder全序列 [B, T, D]
+    Active Head（事件驱动）：
+        判断这周有没有流量
+        输入：z_out + 事件特征（promotion/holiday/event/season）
 
-    改动：mag_head预测相对于mean13 anchor的残差，不是直接预测绝对值。
-    模型学的是"在历史均值基础上调整多少"。
-    远期h的anchor已经通过decay向mean13收缩，残差自然趋近于0。
+    Mag Head（商品特性驱动）：
+        有流量时值是多少
+        输入：stop_gradient(z_out) + 商品静态特征（GL/价格/评论数）
+        stop_gradient确保magnitude不影响encoder的表示学习
 
-    anchor_indices: context_cols里三个mean13的index
-        [total_mean13_idx, buy_mean13_idx, instock_mean13_idx]
+    两个head的特征索引在初始化时从context_cols里查找。
     """
     def __init__(self, d_model, context_dim, horizon=20,
                  hidden=96, n_heads=4, dropout=0.10,
-                 anchor_indices=None):
+                 anchor_indices=None,
+                 active_feat_indices=None,   # 事件特征索引
+                 mag_feat_indices=None,      # 商品特征索引
+                 active_feat_dim=0,
+                 mag_feat_dim=0):
         super().__init__()
-        self.horizon = horizon
-        # anchor_indices: [total_idx, buy_idx, instock_idx]
-        # 如果为None则不用残差预测（向后兼容）
-        self.anchor_indices = anchor_indices
+        self.horizon          = horizon
+        self.anchor_indices   = anchor_indices
+        self.active_feat_indices = active_feat_indices
+        self.mag_feat_indices    = mag_feat_indices
+        self.residual_scale   = 2.0
 
         # future_context + horizon位置编码 → hidden
         self.input_proj = nn.Sequential(
@@ -548,15 +635,14 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Decoder TCN：对20个horizon建模horizon间依赖
+        # Decoder TCN
         self.tcn = nn.ModuleList([
             HorizonTCNBlock(hidden, dilation=1, dropout=dropout),
             HorizonTCNBlock(hidden, dilation=2, dropout=dropout),
             HorizonTCNBlock(hidden, dilation=4, dropout=dropout),
         ])
 
-        # 投影到d_model做cross-attention
-        self.dec_proj   = nn.Linear(hidden, d_model)
+        self.dec_proj  = nn.Linear(hidden, d_model)
 
         # Cross-Attention
         self.cross_attn = nn.MultiheadAttention(
@@ -565,33 +651,30 @@ class TCNDecoderWithCrossAttn(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.post_norm  = nn.LayerNorm(d_model)
+        self.post_norm = nn.LayerNorm(d_model)
 
-        # ── Hurdle双头输出 ────────────────────────────────────
-        # active_head: 这周有没有曝光？ → BCE
+        # ── Active Head（事件驱动）────────────────────────────
+        # 输入：z_out [D] + 专属事件特征 [active_feat_dim]
+        active_in = d_model + max(active_feat_dim, 0)
         self.active_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
+            nn.Linear(active_in, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 3),
         )
 
-        # mag_head: 预测相对于anchor的残差
-        # 输出tanh*scale → 允许正负调整，不允许无限大
-        # anchor + residual → 最终magnitude
+        # ── Mag Head（商品特性驱动）──────────────────────────
+        # 输入：stop_gradient(z_out) [D] + 商品静态特征 [mag_feat_dim]
+        mag_in = d_model + max(mag_feat_dim, 0)
         self.mag_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
+            nn.Linear(mag_in, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 3),
-            nn.Tanh(),   # 输出在(-1, 1)之间
+            nn.Tanh(),
         )
-        # 残差的缩放系数：允许最多上下调整anchor的这个倍数
-        self.residual_scale = 2.0
 
     def forward(self, enc_out, future_context, return_aux=False):
-        # enc_out:        [B, 52, D]
-        # future_context: [B, H, context_dim]
         B, H, _ = future_context.shape
 
         # Horizon位置编码
@@ -601,53 +684,54 @@ class TCNDecoderWithCrossAttn(nn.Module):
         hcos   = torch.cos(2 * torch.pi * h_norm)
 
         # Decoder TCN
-        x = torch.cat([future_context, hsin, hcos], dim=-1)   # [B,H,C+2]
-        z = self.input_proj(x)                                 # [B,H,hidden]
+        x = torch.cat([future_context, hsin, hcos], dim=-1)
+        z = self.input_proj(x)
         for block in self.tcn:
-            z = block(z)                                       # [B,H,hidden]
+            z = block(z)
 
-        # 投影到d_model
-        q = self.dec_proj(z)                                   # [B,H,D]
-
-        # Cross-Attention: 每个h查询全部52周历史
+        q     = self.dec_proj(z)
         attn_out, attn_w = self.cross_attn(
-            q,        # Q [B,H,D]
-            enc_out,  # K [B,52,D]
-            enc_out,  # V [B,52,D]
+            q, enc_out, enc_out,
             need_weights=return_aux,
         )
-
         z_out = self.post_norm(q + attn_out)   # [B,H,D]
 
-        # ── Hurdle active head ────────────────────────────────
-        active_logit = self.active_head(z_out)         # [B,H,3]
-        p_active     = torch.sigmoid(active_logit)     # [B,H,3]
+        # ── Active Head：z_out + 事件特征 ────────────────────
+        if self.active_feat_indices and len(self.active_feat_indices) > 0:
+            active_feats = future_context[:, :, self.active_feat_indices]
+            active_in    = torch.cat([z_out, active_feats], dim=-1)
+        else:
+            active_in = z_out
 
-        # ── Anchor残差magnitude head ──────────────────────────
-        residual = self.mag_head(z_out)                # [B,H,3] ∈ (-1,1)
+        active_logit = self.active_head(active_in)       # [B,H,3]
+        p_active     = torch.sigmoid(active_logit)
 
+        # ── Mag Head：stop_gradient(z_out) + 商品特征 ────────
+        # stop_gradient：magnitude的梯度不流回encoder
+        # encoder只通过active_head学习"什么时候有流量"
+        z_stopped = z_out.detach()
+
+        if self.mag_feat_indices and len(self.mag_feat_indices) > 0:
+            mag_feats = future_context[:, :, self.mag_feat_indices]
+            mag_in    = torch.cat([z_stopped, mag_feats], dim=-1)
+        else:
+            mag_in = z_stopped
+
+        residual = self.mag_head(mag_in)   # [B,H,3] ∈ (-1,1)
+
+        # Anchor残差预测
         if self.anchor_indices is not None:
-            # 从future_context取三个mean13 anchor值
-            # anchor已经在_make_future_context里加了decay，越远越接近mean13
             ti, bi, ii = self.anchor_indices
             anchor = torch.stack([
-                future_context[:, :, ti],   # total_mean13   [B,H]
-                future_context[:, :, bi],   # buy_mean13     [B,H]
-                future_context[:, :, ii],   # instock_mean13 [B,H]
-            ], dim=-1)                      # [B,H,3]
-
-            # log_mag = anchor + residual * scale
-            # anchor是log1p空间的值，residual是相对调整
-            # scale控制最大调整幅度
-            log_mag = F.softplus(
-                anchor + residual * self.residual_scale
-            )   # [B,H,3] > 0
+                future_context[:, :, ti],
+                future_context[:, :, bi],
+                future_context[:, :, ii],
+            ], dim=-1)
+            log_mag = F.softplus(anchor + residual * self.residual_scale)
         else:
-            # 向后兼容：没有anchor就直接用softplus
             log_mag = F.softplus(residual * self.residual_scale)
 
-        # 最终预测 = occurrence × magnitude
-        log_hat = p_active * log_mag   # [B,H,3]
+        log_hat = p_active * log_mag
 
         if return_aux:
             return {
@@ -663,33 +747,86 @@ class TCNDecoderWithCrossAttn(nn.Module):
 
 class ExposureForecastModelV2(nn.Module):
     """
-    入口与原 ExposureForecastModel 完全相同：
-        forward(x, future_context) → log_hat [B, H, 3]
+    TCN全序列Encoder + Cross-Attention Decoder + 分离双Head
 
-    改动：
-        Encoder: 全序列输出 [B,52,D]
-        Decoder: TCN + Cross-Attention + Hurdle双头 + Anchor残差预测
-        anchor_indices 在初始化时从context_cols里查找并传入decoder
+    Active Head专属特征（事件/时间驱动）：
+        ind_promotion, ind_prime_week, holiday/distance/event列
+        order_month/season, ind_new_asin, hist_demand_active_rate
+
+    Mag Head专属特征（商品特性驱动）：
+        glance_view_band_cat, hbt, our_price_log_norm
+        log_review_count, gl_product_group, ind_amxl_hb
+        sort_type, hist_demand_mean13, hist_instock_mean13
     """
+
+    ACTIVE_FEAT_COLS = [
+        "ind_promotion",
+        "ind_prime_week",
+        "stock_static__ind_new_asin",
+        "order_month", "month_sin", "month_cos",
+        "season_winter", "season_spring", "season_summer", "season_fall",
+        "is_event_window", "weeks_to_nearest_event", "abs_weeks_to_nearest_event",
+        "is_pre_event", "is_post_event",
+        "pre_event_proximity", "post_event_decay",
+        "hist_demand_active_rate",
+    ]
+
+    MAG_FEAT_COLS = [
+        "stock_static__glance_view_band__norm",
+        "stock_static__hbt__is_head",
+        "our_price_log_norm",
+        "log_review_count",
+        "stock_static__gl_product_group__code",
+        "stock_static__gl_product_group__freq",
+        "stock_static__ind_amxl_hb",
+        "stock_static__sort_type__norm",
+        "stock_static__ind_top10_brand__code",
+        "hist_demand_mean13_log",
+        "hist_instock_dph_mean13_log",
+    ]
+
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
                  context_cols=None):
         super().__init__()
         self.encoder = HistoryEncoderFull(input_dim=input_dim, d_model=d_model)
 
-        # 从context_cols里找mean13的index
+        col_idx = {c: i for i, c in enumerate(context_cols)} if context_cols else {}
+
+        # anchor indices（mean13）
         anchor_indices = None
-        if context_cols is not None:
-            col_idx = {c: i for i, c in enumerate(context_cols)}
-            try:
-                anchor_indices = [
-                    col_idx["hist_total_dph_mean13_log"],
-                    col_idx["hist_buy_box_dph_mean13_log"],
-                    col_idx["hist_instock_dph_mean13_log"],
-                ]
-                print(f"Anchor indices (mean13): {anchor_indices}")
-            except KeyError as e:
-                print(f"Warning: anchor column not found: {e}, 残差预测disabled")
+        try:
+            anchor_indices = [
+                col_idx["hist_total_dph_mean13_log"],
+                col_idx["hist_buy_box_dph_mean13_log"],
+                col_idx["hist_instock_dph_mean13_log"],
+            ]
+            print(f"Anchor indices (mean13): {anchor_indices}")
+        except KeyError as e:
+            print(f"Warning: anchor column not found: {e}")
+
+        # active head专属特征索引
+        active_feat_indices = []
+        for c in self.ACTIVE_FEAT_COLS:
+            if c in col_idx:
+                active_feat_indices.append(col_idx[c])
+        # 加入所有holiday/distance/event列
+        if context_cols:
+            for i, c in enumerate(context_cols):
+                if (c.startswith("holiday_indicator_") or
+                    c.startswith("distance_") or
+                    c.startswith("event_")):
+                    if i not in active_feat_indices:
+                        active_feat_indices.append(i)
+
+        # mag head专属特征索引
+        mag_feat_indices = []
+        for c in self.MAG_FEAT_COLS:
+            if c in col_idx:
+                mag_feat_indices.append(col_idx[c])
+
+        print(f"Active head feat dim: {len(active_feat_indices)}")
+        print(f"Mag head feat dim:    {len(mag_feat_indices)}")
 
         self.decoder = TCNDecoderWithCrossAttn(
             d_model=d_model,
@@ -699,6 +836,10 @@ class ExposureForecastModelV2(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             anchor_indices=anchor_indices,
+            active_feat_indices=active_feat_indices,
+            mag_feat_indices=mag_feat_indices,
+            active_feat_dim=len(active_feat_indices),
+            mag_feat_dim=len(mag_feat_indices),
         )
 
     def forward(self, x, future_context, return_aux=False):
