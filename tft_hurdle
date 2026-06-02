@@ -1,652 +1,939 @@
 # ============================================================
-# TFTStyleExposureModel with Hurdle Head
+# exposure_clean.py
 #
-# 改动范围：只改 TFTStyleExposureModel 和 tft_exposure_loss
-# 其他所有代码（数据加载、Dataset、训练loop、评估）完全不变
+# 两个 pipeline，仅此而已：
+#   Pipeline A: Best-Attn  (TCN encoder + AnchorAttention blender)
+#   Pipeline B: TFT-Hurdle (VSN + LSTM + CrossAttn + Hurdle head)
 #
-# 核心改动：
-#   原来: head → softplus → log_hat [B,H,3]
-#   现在: active_head → sigmoid → p_active [B,H,3]   (occurrence)
-#         mag_head   → softplus → log_mag  [B,H,3]   (magnitude)
-#         log_hat    = p_active * log_mag              (gated output)
+# 共用：数据加载 / Dataset / 评估指标
 #
-# output shape 完全不变: [B,H,3]
-#   [...,0] = total_dph_hat (log1p scale, gated)
-#   [...,1] = buy_box_dph_hat
-#   [...,2] = in_stock_dph_hat
-#
-# loss 改动：
-#   原来: huber(log_hat, target_log) + mean_penalty + under_penalty
-#   现在: BCE(p_active, active_label)
-#       + huber(log_mag, target_log) on active cells only
-#       + mean_penalty (不变)
+# 入口：
+#   result_attn   = run_best_attn(data_raw1, scot_df)
+#   result_hurdle = run_tft_hurdle(data_raw1, scot_df)
+#   compare_two(result_attn, result_hurdle)
 # ============================================================
 
-
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score
 
-
-# ============================================================
-# 复用原文件的 GRN 和 VariableSelectionNetwork（不改）
-# ============================================================
-
-class GRN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.10):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.gate = nn.Sequential(nn.Linear(hidden_dim, output_dim), nn.Sigmoid())
-        self.skip = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
-        self.norm = nn.LayerNorm(output_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        z = F.elu(self.fc1(x))
-        z = self.dropout(z)
-        z = self.fc2(z)
-        gated = self.gate(z) * z
-        return self.norm(self.skip(x) + gated)
-
-
-class VariableSelectionNetwork(nn.Module):
-    def __init__(self, n_vars, d_model=64, hidden=64, dropout=0.10):
-        super().__init__()
-        self.n_vars = n_vars
-        self.d_model = d_model
-        self.var_proj = nn.ModuleList([nn.Linear(1, d_model) for _ in range(n_vars)])
-        self.weight_net = nn.Sequential(
-            nn.Linear(n_vars, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, n_vars),
-        )
-        self.post = GRN(d_model, hidden, d_model, dropout=dropout)
-
-    def forward(self, x):
-        B, T, Fdim = x.shape
-        if Fdim != self.n_vars:
-            raise ValueError(f"Expected {self.n_vars} variables, got {Fdim}")
-        embs = torch.stack(
-            [self.var_proj[j](x[:, :, j:j+1]) for j in range(self.n_vars)],
-            dim=-2,
-        )  # [B,T,F,D]
-        logits = self.weight_net(x)           # [B,T,F]
-        weights = torch.softmax(logits, dim=-1)
-        selected = torch.sum(embs * weights.unsqueeze(-1), dim=-2)  # [B,T,D]
-        selected = self.post(selected)
-        return selected, weights
-
+torch.manual_seed(42)
+np.random.seed(42)
 
 # ============================================================
-# TFTStyleExposureModel — Hurdle Head 版本
+# 1. DATA
 # ============================================================
 
-class TFTStyleExposureModelHurdle(nn.Module):
-    """
-    与原 TFTStyleExposureModel 完全相同的结构，
-    只把最后的单一 head 换成 Hurdle 双头。
-
-    输入：
-        x              [B, T, input_dim]   历史特征（不变）
-        future_context [B, H, context_dim] 未来已知特征（不变）
-
-    输出：
-        log_hat        [B, H, 3]           与原模型完全相同的 shape/scale
-            [...,0] = total_dph   预测值（log1p-gated）
-            [...,1] = buy_box_dph
-            [...,2] = in_stock_dph
-
-    额外输出（return_aux=True 时）：
-        p_active   [B, H, 3]   三个 DPH 各自的 active 概率（0-1）
-        log_mag    [B, H, 3]   纯 magnitude 预测（未 gate）
-    """
-
-    def __init__(
-        self,
-        input_dim,
-        context_dim,
-        d_model=64,
-        horizon=20,
-        n_heads=4,
-        dropout=0.10,
-    ):
-        super().__init__()
-        self.horizon = horizon
-        self.d_model = d_model
-
-        # ── Encoder 部分（完全不变）──────────────────────────
-        self.hist_vsn = VariableSelectionNetwork(
-            n_vars=input_dim,
-            d_model=d_model,
-            hidden=max(64, d_model),
-            dropout=dropout,
-        )
-
-        self.future_vsn = VariableSelectionNetwork(
-            n_vars=context_dim,
-            d_model=d_model,
-            hidden=max(64, d_model),
-            dropout=dropout,
-        )
-
-        self.encoder_lstm = nn.LSTM(
-            input_size=d_model,
-            hidden_size=d_model,
-            num_layers=1,
-            batch_first=True,
-            dropout=0.0,
-        )
-
-        # ── Decoder 部分（完全不变）──────────────────────────
-        self.decoder_lstm = nn.LSTM(
-            input_size=d_model + 4,   # fut_sel + horizon_features
-            hidden_size=d_model,
-            num_layers=1,
-            batch_first=True,
-            dropout=0.0,
-        )
-
-        # Cross-attention: Q=decoder, K=V=encoder（不变）
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        self.post_attn = GRN(d_model, max(64, d_model), d_model, dropout=dropout)
-
-        # ── Hurdle Head（唯一改动）────────────────────────────
-        hidden = max(64, d_model)
-
-        # Head 1: occurrence — 这个 DPH 在这周 active 吗？
-        # 输出: [B,H,3]，sigmoid → p_active ∈ (0,1)
-        self.active_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 3),
-            # 不加 sigmoid，在 forward 里显式调用，方便 loss 用 BCEWithLogits
-        )
-
-        # Head 2: magnitude — 如果 active，DPH 值是多少？
-        # 输出: [B,H,3]，softplus → log_mag > 0
-        self.mag_head = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 3),
-        )
-
-    # ── horizon position features（不变）─────────────────────
-    def _horizon_features(self, B, H, device, dtype):
-        h = torch.arange(1, H + 1, device=device, dtype=dtype)
-        h_norm = h / max(float(H), 1.0)
-        feats = torch.stack([
-            h_norm,
-            torch.sin(2 * torch.pi * h_norm),
-            torch.cos(2 * torch.pi * h_norm),
-            (h >= 13).float(),
-        ], dim=-1)
-        return feats.view(1, H, 4).expand(B, H, 4)
-
-    def forward(self, x, future_context, return_aux=False):
-        # ── Encoder ──────────────────────────────────────────
-        hist_sel, hist_w = self.hist_vsn(x)
-        fut_sel, fut_w = self.future_vsn(future_context)
-
-        enc_out, (h_n, c_n) = self.encoder_lstm(hist_sel)
-        # enc_out: [B, T=52, d_model]
-
-        # ── Decoder ──────────────────────────────────────────
-        B, H, _ = future_context.shape
-        h_feat = self._horizon_features(B, H, future_context.device, future_context.dtype)
-
-        dec_in = torch.cat([fut_sel, h_feat], dim=-1)   # [B,H, d_model+4]
-        dec_out, _ = self.decoder_lstm(dec_in, (h_n, c_n))
-        # dec_out: [B, H=20, d_model]
-
-        # ── Cross-Attention（不变）────────────────────────────
-        # Q = decoder horizon states
-        # K = V = full encoder history
-        attn_out, attn_weights = self.attn(
-            dec_out,    # Q [B,H,D]
-            enc_out,    # K [B,T,D]
-            enc_out,    # V [B,T,D]
-            need_weights=True,
-        )
-
-        z = self.post_attn(dec_out + attn_out)   # [B,H,D]
-
-        # ── Hurdle Head ───────────────────────────────────────
-        # active_logit: raw logit，用于 BCEWithLogitsLoss（更稳定）
-        active_logit = self.active_head(z)                    # [B,H,3]
-        p_active = torch.sigmoid(active_logit)                # [B,H,3] ∈ (0,1)
-
-        # magnitude: softplus 保证 > 0
-        log_mag = F.softplus(self.mag_head(z))                # [B,H,3]
-
-        # 最终输出：occurrence × magnitude
-        # shape [B,H,3]，与原模型完全相同
-        # 当 p_active≈0 时输出趋近 0，当 p_active≈1 时输出≈log_mag
-        log_hat = p_active * log_mag                          # [B,H,3]
-
-        if return_aux:
-            return {
-                "log_hat": log_hat,
-                "p_active": p_active,          # 新增：active 概率
-                "active_logit": active_logit,  # 新增：用于 loss
-                "log_mag": log_mag,            # 新增：纯 magnitude
-                "hist_var_weights": hist_w,
-                "future_var_weights": fut_w,
-                "attn_weights": attn_weights,
-            }
-
-        return log_hat
-
-
-# ============================================================
-# tft_hurdle_loss
-# 替换原来的 tft_exposure_loss
-#
-# 签名和参数与原 tft_exposure_loss 完全兼容，
-# 只是 log_hat 现在是 gated output，需要额外传 active_logit 和 log_mag
-# ============================================================
-
-def tft_hurdle_loss(
-    log_hat,            # [B,H,3]  gated output（p_active * log_mag）
-    true_total,         # [B,H]
-    true_buy,           # [B,H]
-    true_instock,       # [B,H]
-    active_logit,       # [B,H,3]  raw logit for BCE（新增，从 return_aux 获取）
-    log_mag,            # [B,H,3]  pure magnitude（新增）
-    w_total=0.30,
-    w_buy=0.60,
-    w_instock=1.00,
-    bce_weight=1.00,    # BCE loss 权重
-    mag_weight=1.00,    # magnitude loss 权重
-    mean_weight=0.20,   # mean scale penalty 权重（不变）
-    horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
-):
-    # ── 整理 true ────────────────────────────────────────────
-    true = torch.stack([
-        true_total.clamp(min=0.0),
-        true_buy.clamp(min=0.0),
-        true_instock.clamp(min=0.0),
-    ], dim=-1)   # [B,H,3]
-
-    target_log = torch.log1p(true)   # [B,H,3]
-
-    target_weights = torch.tensor(
-        [w_total, w_buy, w_instock],
-        dtype=log_hat.dtype,
-        device=log_hat.device,
-    ).view(1, 1, 3)
-
-    # ── 辅助权重：高曝光行 + 长 horizon ──────────────────────
-    denom = target_log.detach().mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
-    high_w = 1.0 + high_weight_alpha * target_log.detach() / denom
-
-    H = true.shape[1]
-    h = torch.arange(1, H + 1, device=true.device, dtype=true.dtype).view(1, H, 1)
-    horizon_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
-
-    sample_w = high_w * horizon_w   # [B,H,3]（不含 target_weights，下面分开乘）
-
-    # ── Loss 1: BCE（occurrence）─────────────────────────────
-    # 对三个 DPH 各自判断"这周 active 吗"
-    active_label = (true > 0).float()   # [B,H,3]
-
-    bce = F.binary_cross_entropy_with_logits(
-        active_logit,
-        active_label,
-        reduction="none",
-    )   # [B,H,3]
-
-    bce_loss = (bce * sample_w * target_weights).mean()
-
-    # ── Loss 2: Magnitude Huber（只在 active 周计算）─────────
-    active_mask = active_label   # [B,H,3]
-
-    mag_err = F.huber_loss(
-        log_mag,
-        target_log,
-        delta=1.0,
-        reduction="none",
-    )   # [B,H,3]
-
-    # 只在 true>0 的格子计算，分母用 active cell 数量避免偏移
-    mag_numerator = (mag_err * active_mask * sample_w * target_weights).sum()
-    mag_denominator = (active_mask * sample_w * target_weights).sum().clamp_min(1.0)
-    mag_loss = mag_numerator / mag_denominator
-
-    # ── Loss 3: Mean Scale Penalty（不变）────────────────────
-    pred_level = torch.expm1(log_hat).clamp(min=0.0)
-    mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)))
-    mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
-    mean_loss = (torch.abs(mean_pred - mean_true) * target_weights.view(3)).mean()
-
-    # ── 合并 ─────────────────────────────────────────────────
-    total = (
-        bce_weight  * bce_loss
-        + mag_weight  * mag_loss
-        + mean_weight * mean_loss
-    )
-
-    return total
-
-
-# ============================================================
-# train_tft_hurdle_model
-# 只改了调用方式（需要 return_aux=True 获取 active_logit 和 log_mag）
-# 其他 loop 结构完全不变
-# ============================================================
-
-def train_tft_hurdle_model(
-    model,
-    tr_ld,
-    va_ld,
-    epochs=60,
-    lr=1e-3,
-    patience=8,
-    w_total=0.30,
-    w_buy=0.60,
-    w_instock=1.00,
-    bce_weight=1.00,
-    mag_weight=1.00,
-    mean_weight=0.20,
-    horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
-):
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
-
-    best_val = float("inf")
-    best_sd = None
-    no_improve = 0
-
-    for epoch in range(epochs):
-        model.train()
-        tr_sum, tr_n = 0.0, 0
-
-        for b in tr_ld:
-            # return_aux=True 获取 hurdle 中间量
-            aux = model(b["x"], b["future_context"], return_aux=True)
-
-            loss = tft_hurdle_loss(
-                log_hat=aux["log_hat"],
-                true_total=b["future_total_dph"],
-                true_buy=b["future_buy_box_dph"],
-                true_instock=b["future_instock_dph"],
-                active_logit=aux["active_logit"],
-                log_mag=aux["log_mag"],
-                w_total=w_total,
-                w_buy=w_buy,
-                w_instock=w_instock,
-                bce_weight=bce_weight,
-                mag_weight=mag_weight,
-                mean_weight=mean_weight,
-                horizon_weight_alpha=horizon_weight_alpha,
-                high_weight_alpha=high_weight_alpha,
-            )
-
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-
-            tr_sum += loss.item() * b["x"].shape[0]
-            tr_n += b["x"].shape[0]
-
-        sch.step()
-
-        model.eval()
-        va_sum, va_n = 0.0, 0
-
-        with torch.no_grad():
-            for b in va_ld:
-                aux = model(b["x"], b["future_context"], return_aux=True)
-
-                loss = tft_hurdle_loss(
-                    log_hat=aux["log_hat"],
-                    true_total=b["future_total_dph"],
-                    true_buy=b["future_buy_box_dph"],
-                    true_instock=b["future_instock_dph"],
-                    active_logit=aux["active_logit"],
-                    log_mag=aux["log_mag"],
-                    w_total=w_total,
-                    w_buy=w_buy,
-                    w_instock=w_instock,
-                    bce_weight=bce_weight,
-                    mag_weight=mag_weight,
-                    mean_weight=mean_weight,
-                    horizon_weight_alpha=horizon_weight_alpha,
-                    high_weight_alpha=high_weight_alpha,
-                )
-
-                va_sum += loss.item() * b["x"].shape[0]
-                va_n += b["x"].shape[0]
-
-        tr_loss = tr_sum / max(tr_n, 1)
-        va_loss = va_sum / max(va_n, 1)
-
-        print(f"[TFT-Hurdle] Epoch {epoch+1:03d} | train={tr_loss:.5f} | val={va_loss:.5f}")
-
-        if va_loss < best_val - 1e-6:
-            best_val = va_loss
-            best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        if no_improve >= patience:
-            print(f"[TFT-Hurdle] Early stop at epoch {epoch+1}. Best val={best_val:.5f}")
-            break
-
-    if best_sd is not None:
-        model.load_state_dict(best_sd)
-
-    return model
-
-
-# ============================================================
-# predict_tft_hurdle
-# 输出格式与原 predict_tft_exposure 完全相同
-# 额外输出 p_active 列供诊断用
-# ============================================================
-
-def predict_tft_hurdle(model, va_ld, apply_funnel_constraint=True):
-    import pandas as pd
-
+def _safe_num(s, fill=0.0):
+    return pd.to_numeric(s, errors="coerce").fillna(fill)
+
+
+def _encode_static(df):
+    out = []
+    for c in ["gl_product_group", "ind_top10_brand"]:
+        if c not in df.columns:
+            continue
+        raw = df[c].astype(str).fillna("MISSING")
+        codes, uniques = pd.factorize(raw)
+        df[f"static_{c}_code"] = codes / max(len(uniques) - 1, 1)
+        df[f"static_{c}_freq"] = raw.map(raw.value_counts(normalize=True)).fillna(0.0)
+        out += [f"static_{c}_code", f"static_{c}_freq"]
+    return df, out
+
+
+def _event_calendar(min_year, max_year):
     rows = []
-    model.eval()
-
-    with torch.no_grad():
-        for b in va_ld:
-            aux = model(b["x"], b["future_context"], return_aux=True)
-
-            # log_hat shape [B,H,3]，与原模型完全相同
-            pred = torch.expm1(aux["log_hat"]).clamp(min=0.0).cpu().numpy()
-            p_act = aux["p_active"].cpu().numpy()   # [B,H,3]
-
-            if apply_funnel_constraint:
-                # total ≥ buy_box ≥ in_stock（物理约束不变）
-                pred[:, :, 1] = np.minimum(pred[:, :, 1], pred[:, :, 0])
-                pred[:, :, 2] = np.minimum(pred[:, :, 2], pred[:, :, 1])
-
-            B, H = b["future_instock_dph"].shape
-
-            for i in range(B):
-                for h in range(H):
-                    rows.append({
-                        "asin": b["asin"][i],
-                        "order_week": pd.to_datetime(b["target_week"][h][i]),
-                        "horizon": h + 1,
-
-                        # ── 与原格式完全相同 ──
-                        "true_total_dph":    b["future_total_dph"][i, h].item(),
-                        "pred_total_dph":    pred[i, h, 0],
-
-                        "true_buy_box_dph":  b["future_buy_box_dph"][i, h].item(),
-                        "pred_buy_box_dph":  pred[i, h, 1],
-
-                        "true_instock_dph":  b["future_instock_dph"][i, h].item(),
-                        "pred_instock_dph":  pred[i, h, 2],
-
-                        "true_demand":       b["future_demand"][i, h].item(),
-
-                        # ── 额外诊断列（可选）──
-                        "p_active_total":    p_act[i, h, 0],
-                        "p_active_buy_box":  p_act[i, h, 1],
-                        "p_active_instock":  p_act[i, h, 2],
-                    })
-
+    for y in range(min_year - 1, max_year + 2):
+        nov = pd.date_range(f"{y}-11-01", f"{y}-11-30", freq="D")
+        tg = nov[nov.weekday == 3][3]
+        for name, date in [
+            ("NewYear",      pd.Timestamp(f"{y}-01-01")),
+            ("PrimeDay",     pd.Timestamp(f"{y}-07-15")),
+            ("BackToSchool", pd.Timestamp(f"{y}-08-15")),
+            ("Thanksgiving", tg),
+            ("BlackFriday",  tg + pd.Timedelta(days=1)),
+            ("CyberMonday",  tg + pd.Timedelta(days=4)),
+            ("Christmas",    pd.Timestamp(f"{y}-12-25")),
+        ]:
+            rows.append({"name": name, "week": date.to_period("W-SUN").start_time})
     return pd.DataFrame(rows)
 
 
-# ============================================================
-# run_tft_hurdle_exposure_forecast
-# 替换原来的 run_tft_exposure_forecast
-# 数据加载、split、评估全部复用原函数
-# ============================================================
+def _add_event_features(df, week_col="order_week", window=2):
+    df = df.copy()
+    df["_wk"] = pd.to_datetime(df[week_col]).dt.to_period("W-SUN").apply(lambda r: r.start_time)
+    cal = _event_calendar(df[week_col].dt.year.min(), df[week_col].dt.year.max())
+    names = sorted(cal["name"].unique())
 
-def run_tft_hurdle_exposure_forecast(
-    data_raw1,
-    scot_df,
-    n_asins=5000,
-    seed=42,
-    history=52,
-    horizon=20,
-    d_model=64,
-    n_heads=4,
-    batch_size=64,
-    epochs=60,
-    lr=1e-3,
-    patience=8,
-    dph_cap_q=0.995,
-    remove_extreme=True,
-    extreme_q=0.99,
-    apply_funnel_constraint=True,
-    bce_weight=1.00,
-    mag_weight=1.00,
-    mean_weight=0.20,
-    high_weight_alpha=1.00,
-    horizon_weight_alpha=0.40,
-):
-    print("\n" + "=" * 100)
-    print("TFT-HURDLE EXPOSURE FORECAST")
-    print("=" * 100)
+    df["is_event_window"] = 0.0
+    df["weeks_to_event"]  = 99.0
+    for n in names:
+        df[f"event_{n}_win"] = 0.0
 
-    # ── 数据加载（完全复用原函数）────────────────────────────
-    df = prepare_data_from_sample_scot_intersection(
-        data_raw1=data_raw1,
-        scot_df=scot_df,
-        n_asins=n_asins,
-        seed=seed,
+    for _, r in cal.iterrows():
+        diff = ((df["_wk"] - r["week"]).dt.days / 7).round().astype(int)
+        win  = diff.abs() <= window
+        df.loc[win, "is_event_window"] = 1.0
+        df.loc[win, f"event_{r['name']}_win"] = 1.0
+        better = diff.abs() < df["weeks_to_event"].abs()
+        df.loc[better, "weeks_to_event"] = diff[better].clip(-20, 20) / 20.0
+
+    df = df.drop(columns=["_wk"])
+    event_cols = ["is_event_window", "weeks_to_event"] + [f"event_{n}_win" for n in names]
+    return df, event_cols
+
+
+def prepare_data(data_raw1, scot_df, n_asins=5000, seed=42):
+    df   = data_raw1.copy()
+    scot = scot_df.copy()
+    df["asin"]       = df["asin"].astype(str)
+    scot["asin"]     = scot["asin"].astype(str)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+
+    rng   = np.random.default_rng(seed)
+    asins = rng.choice(df["asin"].unique(), size=min(n_asins, df["asin"].nunique()), replace=False)
+    keep  = sorted(set(asins) & set(scot["asin"].unique()))
+    print(f"ASINs after intersection: {len(keep)}")
+    return df[df["asin"].isin(keep)].copy()
+
+
+def filter_extremes(df, q=0.99):
+    stats = df.groupby("asin")[["fbi_demand","total_dph","buy_box_dph","in_stock_dph"]].max()
+    mask  = (stats <= stats.quantile(q)).all(axis=1)
+    keep  = stats[mask].index
+    print(f"ASINs after extreme filter: {len(keep)}")
+    return df[df["asin"].isin(keep)].copy()
+
+
+def load_data(df, dph_cap_q=0.995):
+    df = df.copy()
+    df["asin"]       = df["asin"].astype(str)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+    df = df.sort_values(["asin", "order_week"]).reset_index(drop=True)
+
+    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph"]:
+        df[c] = _safe_num(df[c]).clip(lower=0.0)
+    for c in ["total_dph", "buy_box_dph", "in_stock_dph"]:
+        df[c] = df[c].clip(upper=df[c].quantile(dph_cap_q))
+
+    df["our_price"] = _safe_num(df.get("our_price", 0.0)).clip(lower=0.0)
+    df["scot_oos"]  = _safe_num(df.get("scot_oos",  0.0)).clip(0, 1)
+
+    df["month"]      = df["order_week"].dt.month.astype(float)
+    df["month_sin"]  = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"]  = np.cos(2 * np.pi * df["month"] / 12)
+
+    df, event_cols  = _add_event_features(df)
+    df, static_cols = _encode_static(df)
+
+    holiday_cols   = [c for c in df.columns if c.startswith("holiday_indicator_")]
+    distance_cols  = [c for c in df.columns if c.startswith("distance_")]
+    for c in holiday_cols + distance_cols:
+        df[c] = _safe_num(df[c])
+
+    ctx_cols = (
+        ["our_price", "month", "month_sin", "month_cos"]
+        + holiday_cols + distance_cols
+        + event_cols + static_cols
+        + ["hist_total_last", "hist_total_mean4", "hist_total_mean13",
+           "hist_buy_last",   "hist_buy_mean4",   "hist_buy_mean13",
+           "hist_instock_last","hist_instock_mean4","hist_instock_mean13"]
     )
+    ctx_cols = list(dict.fromkeys(ctx_cols))
+    for c in ctx_cols:
+        if c not in df.columns:
+            df[c] = 0.0
 
-    if remove_extreme:
-        df = filter_extreme_asins(df, q=extreme_q)
+    asin_data = {}
+    for asin, g in df.groupby("asin"):
+        g = g.sort_values("order_week").reset_index(drop=True)
+        T = len(g)
+        idx = np.arange(T)
 
-    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+        price = g["our_price"].values.astype(np.float32)
+        if price.std() > 1e-8:
+            price = (price - price.mean()) / (price.std() + 1e-8)
 
-    tr_ds = ExposureDataset(data, history=history, horizon=horizon, mode="train",  val_weeks=horizon)
-    va_ds = ExposureDataset(data, history=history, horizon=horizon, mode="val",    val_weeks=horizon)
+        feats = np.stack([
+            np.log1p(g["fbi_demand"].values),
+            (g["fbi_demand"].values > 0).astype(float),
+            np.log1p(g["total_dph"].values),
+            np.log1p(g["buy_box_dph"].values),
+            np.log1p(g["in_stock_dph"].values),
+            price,
+            g["scot_oos"].values,
+            np.sin(2 * np.pi * idx / 52),
+            np.cos(2 * np.pi * idx / 52),
+        ], axis=1).astype(np.float32)
 
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
+        asin_data[asin] = {
+            "week":         g["order_week"].values,
+            "features":     feats,
+            "demand":       g["fbi_demand"].values.astype(np.float32),
+            "total_dph":    g["total_dph"].values.astype(np.float32),
+            "buy_box_dph":  g["buy_box_dph"].values.astype(np.float32),
+            "in_stock_dph": g["in_stock_dph"].values.astype(np.float32),
+            "future_ctx":   g[ctx_cols].values.astype(np.float32),
+            "ctx_cols":     ctx_cols,
+        }
 
-    print("Train samples:", len(tr_ds))
-    print("Val samples:",   len(va_ds))
+    print(f"Loaded {len(asin_data)} ASINs | ctx_dim={len(ctx_cols)}")
+    return asin_data, len(ctx_cols), ctx_cols
+
+
+# ============================================================
+# 2. DATASET
+# ============================================================
+
+class ExposureDataset(Dataset):
+    def __init__(self, asin_data, history=52, horizon=20, mode="train", val_weeks=20):
+        self.data    = asin_data
+        self.history = history
+        self.horizon = horizon
+        self.samples = []
+
+        for asin, d in asin_data.items():
+            T = len(d["features"])
+            if mode == "train":
+                starts = range(max(0, T - val_weeks - horizon - history + 1))
+            else:
+                s = T - history - horizon
+                starts = [s] if s >= 0 else []
+            for s in starts:
+                self.samples.append((asin, s))
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _hmean(arr, end, w):
+        x = arr[max(0, end - w):end]
+        return float(x.mean()) if len(x) else 0.0
+
+    def _make_ctx(self, d, start):
+        h, H = self.history, self.horizon
+        end   = start + h
+        fc    = d["future_ctx"][end:end + H].copy()
+        cols  = {c: i for i, c in enumerate(d["ctx_cols"])}
+
+        for src, keys in [
+            (d["total_dph"],    ["hist_total_last",  "hist_total_mean4",  "hist_total_mean13"]),
+            (d["buy_box_dph"],  ["hist_buy_last",    "hist_buy_mean4",    "hist_buy_mean13"]),
+            (d["in_stock_dph"], ["hist_instock_last","hist_instock_mean4","hist_instock_mean13"]),
+        ]:
+            vals = [
+                np.log1p(src[end - 1]) if end > 0 else 0.0,
+                np.log1p(self._hmean(src, end, 4)),
+                np.log1p(self._hmean(src, end, 13)),
+            ]
+            for k, v in zip(keys, vals):
+                if k in cols:
+                    fc[:, cols[k]] = v
+        return fc
+
+    def __getitem__(self, i):
+        asin, start = self.samples[i]
+        d = self.data[asin]
+        h, H = self.history, self.horizon
+        end = start + h
+        return {
+            "asin":           asin,
+            "target_week":    [str(w)[:10] for w in d["week"][end:end + H]],
+            "x":              torch.tensor(d["features"][start:end],     dtype=torch.float32),
+            "future_ctx":     torch.tensor(self._make_ctx(d, start),     dtype=torch.float32),
+            "future_total":   torch.tensor(d["total_dph"][end:end + H],  dtype=torch.float32),
+            "future_buy":     torch.tensor(d["buy_box_dph"][end:end + H],dtype=torch.float32),
+            "future_instock": torch.tensor(d["in_stock_dph"][end:end + H],dtype=torch.float32),
+            "future_demand":  torch.tensor(d["demand"][end:end + H],     dtype=torch.float32),
+        }
+
+
+def make_loaders(asin_data, history=52, horizon=20, batch_size=64):
+    tr = ExposureDataset(asin_data, history, horizon, mode="train")
+    va = ExposureDataset(asin_data, history, horizon, mode="val")
+    tr_ld = DataLoader(tr, batch_size=batch_size, shuffle=True)
+    va_ld = DataLoader(va, batch_size=batch_size, shuffle=False)
+    print(f"Train={len(tr)} | Val={len(va)}")
+    return tr_ld, va_ld
+
+
+# ============================================================
+# 3. METRICS
+# ============================================================
+
+def _wape(y, p):
+    y, p = np.asarray(y, float), np.asarray(p, float)
+    return np.abs(y - p).sum() / (np.abs(y).sum() + 1e-8)
+
+def _corr(y, p, method="pearson"):
+    y, p = pd.Series(y, dtype=float), pd.Series(p, dtype=float)
+    if y.std() < 1e-8 or p.std() < 1e-8:
+        return np.nan
+    return y.corr(p, method=method)
+
+def _auc(y_bin, score):
+    y_bin = np.asarray(y_bin, int)
+    score = np.asarray(score, float)
+    if len(np.unique(y_bin)) < 2:
+        return np.nan
+    return roc_auc_score(y_bin, score)
+
+def _row_metrics(y, p):
+    eps = 1e-8
+    return {
+        "true_mean":  float(y.mean()),
+        "pred_mean":  float(p.mean()),
+        "ratio":      float(p.mean() / (y.mean() + eps)),
+        "WAPE":       _wape(y, p),
+        "underbias":  float(np.maximum(y - p, 0).sum() / (np.abs(y).sum() + eps)),
+        "active_AUC": _auc(y > 0, p),
+        "Pearson":    _corr(y, p, "pearson"),
+        "Spearman":   _corr(y, p, "spearman"),
+    }
+
+def evaluate(pred_df):
+    """
+    Print compact by-horizon table for in_stock_dph.
+    Returns dict with overall and by_horizon DataFrames.
+    """
+    specs = [
+        ("total_dph",    "true_total_dph",   "pred_total_dph"),
+        ("buy_box_dph",  "true_buy_box_dph",  "pred_buy_box_dph"),
+        ("in_stock_dph", "true_instock_dph",  "pred_instock_dph"),
+    ]
+
+    overall_rows = []
+    for name, tc, pc in specs:
+        m = _row_metrics(pred_df[tc].values, pred_df[pc].values)
+        m["target"] = name
+        overall_rows.append(m)
+    overall = pd.DataFrame(overall_rows)
+
+    by_h_rows = []
+    for h, g in pred_df.groupby("horizon"):
+        m = _row_metrics(g["true_instock_dph"].values, g["pred_instock_dph"].values)
+        m["horizon"] = h
+        by_h_rows.append(m)
+    by_h = pd.DataFrame(by_h_rows).sort_values("horizon")
+
+    print("\n" + "=" * 80)
+    print("OVERALL")
+    print("=" * 80)
+    print(overall[["target","true_mean","pred_mean","ratio","WAPE","active_AUC","Spearman"]].round(4).to_string(index=False))
+
+    print("\n" + "=" * 80)
+    print("IN_STOCK BY HORIZON")
+    print("=" * 80)
+    print(by_h[["horizon","true_mean","pred_mean","ratio","WAPE","underbias","active_AUC"]].round(4).to_string(index=False))
+
+    return {"overall": overall, "by_horizon": by_h}
+
+
+def add_naive_baselines(pred_df, va_ld, ctx_cols):
+    idx = {c: i for i, c in enumerate(ctx_cols)}
+    rows = []
+    for b in va_ld:
+        fc = b["future_ctx"].numpy()
+        B, H, _ = fc.shape
+        for i in range(B):
+            for h in range(H):
+                row = {"asin": b["asin"][i],
+                       "order_week": pd.to_datetime(b["target_week"][h][i]),
+                       "horizon": h + 1}
+                for mode, keys in [
+                    ("last",   ["hist_total_last",   "hist_buy_last",   "hist_instock_last"]),
+                    ("mean4",  ["hist_total_mean4",  "hist_buy_mean4",  "hist_instock_mean4"]),
+                    ("mean13", ["hist_total_mean13", "hist_buy_mean13", "hist_instock_mean13"]),
+                ]:
+                    for col, key in zip(["total","buy","instock"], keys):
+                        if key in idx:
+                            row[f"naive_{col}_{mode}"] = np.expm1(fc[i, h, idx[key]])
+                rows.append(row)
+
+    base = pd.DataFrame(rows)
+    return pred_df.merge(base, on=["asin", "order_week", "horizon"], how="left")
+
+
+def make_exposure_hat(pred_df):
+    """Final output format for demand model."""
+    return pred_df[["asin","order_week",
+                    "pred_total_dph","pred_buy_box_dph","pred_instock_dph"]].copy()
+
+
+# ============================================================
+# 4. PIPELINE A: BEST-ATTN
+#    TCN Encoder + AnchorAttention Blender
+# ============================================================
+
+# -- 4a. TCN Encoder --
+
+class CausalConv1d(nn.Module):
+    def __init__(self, d, k=2, dil=1):
+        super().__init__()
+        self.pad  = (k - 1) * dil
+        self.conv = nn.Conv1d(d, d, k, dilation=dil)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, (self.pad, 0)))
+
+
+class TCNEncoder(nn.Module):
+    def __init__(self, input_dim, d_model=64):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, d_model)
+        dilations = [1, 2, 4, 8, 13, 26]
+        self.convs = nn.ModuleList([CausalConv1d(d_model, dil=d) for d in dilations])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
+        self.final = nn.LayerNorm(d_model)
+
+    def forward(self, x):                       # x: [B,T,F]
+        h = self.proj(x).transpose(1, 2)        # [B,D,T]
+        for conv, norm in zip(self.convs, self.norms):
+            h = h + conv(h)
+            h = F.gelu(norm(h.transpose(1, 2))).transpose(1, 2)
+        return self.final(h.transpose(1, 2)[:, -1, :])   # [B,D]
+
+
+class TCNDecoder(nn.Module):
+    def __init__(self, d_model, ctx_dim, horizon=20, hidden=96, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(d_model + ctx_dim + 2, hidden), nn.ReLU(), nn.Dropout(dropout))
+        self.tcn  = nn.ModuleList([
+            self._block(hidden, dil, dropout) for dil in [1, 2, 4]])
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden, 3))
+        self.H = horizon
+
+    @staticmethod
+    def _block(d, dil, drop):
+        pad = dil
+        return nn.Sequential(
+            nn.Conv1d(d, d, 3, padding=pad, dilation=dil), nn.ReLU(), nn.Dropout(drop),
+            nn.Conv1d(d, d, 3, padding=pad, dilation=dil), nn.ReLU(), nn.Dropout(drop))
+
+    def forward(self, h_t, ctx):               # h_t:[B,D]  ctx:[B,H,C]
+        B, H, _ = ctx.shape
+        h_rep = h_t.unsqueeze(1).expand(B, H, -1)
+        hpos  = torch.arange(H, device=ctx.device).float().view(1, H, 1).expand(B, H, 1) / H
+        hsin  = torch.sin(2 * np.pi * hpos)
+        hcos  = torch.cos(2 * np.pi * hpos)
+        z = self.proj(torch.cat([h_rep, ctx, hsin, hcos], -1))  # [B,H,hidden]
+        for blk in self.tcn:
+            r = z.transpose(1, 2)
+            out = blk(r)
+            if out.shape[2] != r.shape[2]:
+                m = min(out.shape[2], r.shape[2])
+                out, r = out[:, :, :m], r[:, :, :m]
+            z = nn.LayerNorm(z.shape[-1]).to(z.device)(z + out.transpose(1, 2))
+        return F.softplus(self.head(z))         # [B,H,3]
+
+
+class TCNExposureModel(nn.Module):
+    def __init__(self, input_dim, ctx_dim, d_model=64, horizon=20):
+        super().__init__()
+        self.encoder = TCNEncoder(input_dim, d_model)
+        self.decoder = TCNDecoder(d_model, ctx_dim, horizon, max(96, d_model * 2))
+
+    def forward(self, x, ctx):
+        return self.decoder(self.encoder(x), ctx)
+
+
+# -- 4b. Anchor Attention Blender --
+
+class AnchorBlender(nn.Module):
+    """Learns weights over [model, naive_last, naive_mean4, naive_mean13]."""
+    def __init__(self, input_dim, hidden=64, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),   nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 4))
+
+    def forward(self, x, candidates):
+        w = torch.softmax(self.net(x), dim=-1)
+        return (w * candidates).sum(-1), w
+
+
+def _blender_features(pred_df, ctx_cols, target="in_stock_dph"):
+    mapping = {
+        "in_stock_dph": ("true_instock_dph",  "pred_instock_dph",
+                         ["naive_instock_last","naive_instock_mean4","naive_instock_mean13"]),
+        "buy_box_dph":  ("true_buy_box_dph",   "pred_buy_box_dph",
+                         ["naive_buy_last","naive_buy_mean4","naive_buy_mean13"]),
+        "total_dph":    ("true_total_dph",      "pred_total_dph",
+                         ["naive_total_last","naive_total_mean4","naive_total_mean13"]),
+    }
+    true_col, pred_col, naive_cols = mapping[target]
+
+    df = pred_df.copy()
+    h  = df["horizon"].astype(float).values
+    hn = h / h.max()
+
+    cands = df[[pred_col] + naive_cols].fillna(0).clip(lower=0).values.astype(np.float32)
+    cands_log = np.log1p(cands)
+    cz = (cands_log - cands_log.mean(1, keepdims=True)) / (cands_log.std(1, keepdims=True) + 1e-6)
+
+    h_feat = np.stack([hn, np.sin(2*np.pi*hn), np.cos(2*np.pi*hn),
+                       (h<=5).astype(float), ((h>5)&(h<=12)).astype(float),
+                       (h>12).astype(float)], axis=1).astype(np.float32)
+
+    X = np.concatenate([h_feat, cands_log, cz], axis=1).astype(np.float32)
+    xm = X.mean(0, keepdims=True); xs = X.std(0, keepdims=True) + 1e-6
+    Xn = (X - xm) / xs
+
+    y = df[true_col].fillna(0).clip(lower=0).values.astype(np.float32)
+    return Xn, cands, y, xm, xs
+
+
+def _train_blender(Xn, cands, y, hidden=64, epochs=80, lr=1e-3, patience=10, seed=42):
+    torch.manual_seed(seed); np.random.seed(seed)
+    n = len(Xn)
+    idx = np.random.permutation(n)
+    nv  = max(int(0.2 * n), 1)
+    vi, ti = idx[:nv], idx[nv:]
+
+    def batch(I, bs=1024):
+        for i in range(0, len(I), bs):
+            sl = I[i:i+bs]
+            yield (torch.tensor(Xn[sl]), torch.tensor(cands[sl]), torch.tensor(y[sl]))
+
+    model = AnchorBlender(Xn.shape[1], hidden)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    best_val, best_sd, no_imp = float("inf"), None, 0
+
+    for ep in range(epochs):
+        model.train()
+        for xb, cb, yb in batch(ti):
+            pred, w = model(xb, cb)
+            loss = F.huber_loss(torch.log1p(pred.clamp(0)), torch.log1p(yb.clamp(0)))
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+
+        model.eval()
+        vl = []
+        with torch.no_grad():
+            for xb, cb, yb in batch(vi):
+                pred, _ = model(xb, cb)
+                vl.append(F.huber_loss(torch.log1p(pred.clamp(0)), torch.log1p(yb.clamp(0))).item())
+        vl = float(np.mean(vl))
+        if vl < best_val - 1e-6:
+            best_val = vl
+            best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
+            no_imp   = 0
+        else:
+            no_imp += 1
+        if no_imp >= patience:
+            break
+
+    model.load_state_dict(best_sd)
+    return model
+
+
+def _apply_blender(pred_df, model, Xn, cands, target, out_col):
+    model.eval()
+    with torch.no_grad():
+        pred, w = model(torch.tensor(Xn), torch.tensor(cands))
+    out = pred_df.copy()
+    out[out_col] = pred.numpy()
+    cols = ["w_model","w_last","w_mean4","w_mean13"]
+    for j, c in enumerate(cols):
+        out[f"attn_{target}_{c}"] = w[:, j].numpy()
+    return out
+
+
+def run_anchor_attention(pred_df, targets=("total_dph","buy_box_dph","in_stock_dph")):
+    out = pred_df.copy()
+    col_map = {"in_stock_dph":"pred_instock_dph",
+               "buy_box_dph": "pred_buy_box_dph",
+               "total_dph":   "pred_total_dph"}
+    for target in targets:
+        print(f"  Training blender: {target}")
+        Xn, cands, y, _, _ = _blender_features(out, [], target)
+        model = _train_blender(Xn, cands, y)
+        out   = _apply_blender(out, model, Xn, cands, target, col_map[target])
+    return out
+
+
+# -- 4c. TCN loss + train --
+
+def tcn_loss(log_hat, true_total, true_buy, true_instock,
+             w=(0.3, 0.6, 1.0), mean_w=0.2):
+    true = torch.stack([true_total.clamp(0), true_buy.clamp(0), true_instock.clamp(0)], -1)
+    tw   = torch.tensor(w, device=log_hat.device).view(1,1,3)
+    pt   = F.huber_loss(log_hat, torch.log1p(true), delta=1.0, reduction="none")
+    pt   = (pt * tw).mean()
+    pl   = torch.expm1(log_hat).clamp(0)
+    mp   = torch.log1p(pl.mean((0,1)))
+    mt   = torch.log1p(true.mean((0,1)))
+    ml   = (torch.abs(mp - mt) * tw.view(3)).mean()
+    return pt + mean_w * ml
+
+
+def _train_loop(model, tr_ld, va_ld, loss_fn, epochs, lr, patience, tag=""):
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs,1))
+    best_val, best_sd, no_imp = float("inf"), None, 0
+
+    for ep in range(epochs):
+        model.train()
+        tl, tn = 0.0, 0
+        for b in tr_ld:
+            out  = model(b["x"], b["future_ctx"])
+            loss = loss_fn(out, b["future_total"], b["future_buy"], b["future_instock"])
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+            tl += loss.item() * b["x"].shape[0]; tn += b["x"].shape[0]
+        sch.step()
+
+        model.eval(); vl, vn = 0.0, 0
+        with torch.no_grad():
+            for b in va_ld:
+                out  = model(b["x"], b["future_ctx"])
+                loss = loss_fn(out, b["future_total"], b["future_buy"], b["future_instock"])
+                vl  += loss.item() * b["x"].shape[0]; vn += b["x"].shape[0]
+
+        tl /= max(tn,1); vl /= max(vn,1)
+        print(f"[{tag}] Ep {ep+1:03d} | train={tl:.5f} | val={vl:.5f}")
+
+        if vl < best_val - 1e-6:
+            best_val = vl
+            best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
+            no_imp   = 0
+        else:
+            no_imp += 1
+        if no_imp >= patience:
+            print(f"[{tag}] Early stop. best_val={best_val:.5f}"); break
+
+    model.load_state_dict(best_sd)
+    return model
+
+
+def _predict(model, va_ld):
+    rows = []; model.eval()
+    with torch.no_grad():
+        for b in va_ld:
+            pred = torch.expm1(model(b["x"], b["future_ctx"])).clamp(0).cpu().numpy()
+            B, H = b["future_instock"].shape
+            for i in range(B):
+                for h in range(H):
+                    rows.append({
+                        "asin":           b["asin"][i],
+                        "order_week":     pd.to_datetime(b["target_week"][h][i]),
+                        "horizon":        h + 1,
+                        "true_total_dph":  b["future_total"][i,h].item(),
+                        "pred_total_dph":  pred[i,h,0],
+                        "true_buy_box_dph":b["future_buy"][i,h].item(),
+                        "pred_buy_box_dph":pred[i,h,1],
+                        "true_instock_dph":b["future_instock"][i,h].item(),
+                        "pred_instock_dph":pred[i,h,2],
+                        "true_demand":     b["future_demand"][i,h].item(),
+                    })
+    return pd.DataFrame(rows)
+
+
+# -- 4d. Best-Attn runner --
+
+def run_best_attn(data_raw1, scot_df, n_asins=5000, seed=42,
+                  history=52, horizon=20, d_model=64, batch_size=64,
+                  epochs=60, lr=1e-3, patience=8):
+    print("\n" + "="*80 + "\nPIPELINE A: BEST-ATTN\n" + "="*80)
+
+    df = prepare_data(data_raw1, scot_df, n_asins, seed)
+    df = filter_extremes(df)
+    asin_data, ctx_dim, ctx_cols = load_data(df)
+    tr_ld, va_ld = make_loaders(asin_data, history, horizon, batch_size)
 
     input_dim = next(iter(tr_ld))["x"].shape[-1]
+    model = TCNExposureModel(input_dim, ctx_dim, d_model, horizon)
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    # ── 模型（Hurdle 版）─────────────────────────────────────
-    model = TFTStyleExposureModelHurdle(
-        input_dim=input_dim,
-        context_dim=context_dim,
-        d_model=d_model,
-        horizon=horizon,
-        n_heads=n_heads,
-        dropout=0.10,
-    )
+    _train_loop(model, tr_ld, va_ld,
+                lambda o, t, b, i: tcn_loss(o, t, b, i),
+                epochs, lr, patience, tag="TCN")
 
-    print("Input dim:",  input_dim)
-    print("Context dim:", context_dim)
-    print("Params:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+    pred_df = _predict(model, va_ld)
+    pred_df = add_naive_baselines(pred_df, va_ld, ctx_cols)
+    pred_df = run_anchor_attention(pred_df)
 
-    # ── 训练 ─────────────────────────────────────────────────
-    train_tft_hurdle_model(
-        model=model,
-        tr_ld=tr_ld,
-        va_ld=va_ld,
-        epochs=epochs,
-        lr=lr,
-        patience=patience,
-        bce_weight=bce_weight,
-        mag_weight=mag_weight,
-        mean_weight=mean_weight,
-        high_weight_alpha=high_weight_alpha,
-        horizon_weight_alpha=horizon_weight_alpha,
-    )
-
-    # ── 预测（输出格式与原版完全相同）───────────────────────
-    pred_df = predict_tft_hurdle(
-        model=model,
-        va_ld=va_ld,
-        apply_funnel_constraint=apply_funnel_constraint,
-    )
-
-    # ── 评估（复用原诊断函数，不改）────────────────────────
-    pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
-    diagnostics = print_exposure_diagnostics(pred_df)
-    exposure_quality = diagnose_exposure_prediction_quality(pred_df)
-    exposure_hat_for_demand = make_external_hat_df_from_tft(pred_df)
+    print("\n--- Best-Attn Evaluation ---")
+    diag = evaluate(pred_df)
 
     return {
-        "model": model,
-        "forecast_df": pred_df,
-        "diagnostics": diagnostics,
-        "exposure_quality": exposure_quality,
-        "tr_ld": tr_ld,
-        "va_ld": va_ld,
-        "context_cols": context_cols,
-        "context_dim": context_dim,
-        "data": data,
-        "exposure_hat_for_demand": exposure_hat_for_demand,
+        "model":    model,
+        "pred_df":  pred_df,
+        "diag":     diag,
+        "exposure_hat": make_exposure_hat(pred_df),
     }
 
 
 # ============================================================
-# 使用方法（替换原来的 run_tft_exposure_forecast）
+# 5. PIPELINE B: TFT-HURDLE
+#    VSN + LSTM Encoder + LSTM Decoder + CrossAttn + Hurdle Head
+# ============================================================
+
+class GRN(nn.Module):
+    def __init__(self, in_d, hid, out_d, dropout=0.1):
+        super().__init__()
+        self.fc1  = nn.Linear(in_d, hid)
+        self.fc2  = nn.Linear(hid,  out_d)
+        self.gate = nn.Sequential(nn.Linear(hid, out_d), nn.Sigmoid())
+        self.skip = nn.Linear(in_d, out_d) if in_d != out_d else nn.Identity()
+        self.norm = nn.LayerNorm(out_d)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        z = self.drop(F.elu(self.fc1(x)))
+        return self.norm(self.skip(x) + self.gate(z) * self.fc2(z))
+
+
+class VSN(nn.Module):
+    def __init__(self, n_vars, d_model=64, hidden=64, dropout=0.1):
+        super().__init__()
+        self.proj   = nn.ModuleList([nn.Linear(1, d_model) for _ in range(n_vars)])
+        self.w_net  = nn.Sequential(
+            nn.Linear(n_vars, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, n_vars))
+        self.post   = GRN(d_model, hidden, d_model, dropout)
+        self.n_vars = n_vars
+
+    def forward(self, x):                       # x: [B,T,F]
+        B, T, F = x.shape
+        embs = torch.stack([self.proj[j](x[:,:,j:j+1]) for j in range(F)], dim=-2)  # [B,T,F,D]
+        w    = torch.softmax(self.w_net(x), dim=-1)                                  # [B,T,F]
+        sel  = (embs * w.unsqueeze(-1)).sum(-2)                                       # [B,T,D]
+        return self.post(sel), w
+
+
+class TFTHurdleModel(nn.Module):
+    """
+    VSN → LSTM Encoder → LSTM Decoder → Cross-Attention → Hurdle Head
+
+    Output: log_hat [B,H,3]  (same shape as TCNExposureModel)
+    Active prob available via return_aux=True.
+    """
+    def __init__(self, input_dim, ctx_dim, d_model=64, horizon=20, n_heads=4, dropout=0.1):
+        super().__init__()
+        H = max(64, d_model)
+
+        self.hist_vsn    = VSN(input_dim, d_model, H, dropout)
+        self.fut_vsn     = VSN(ctx_dim,   d_model, H, dropout)
+        self.enc_lstm    = nn.LSTM(d_model, d_model, batch_first=True)
+        self.dec_lstm    = nn.LSTM(d_model + 4, d_model, batch_first=True)
+        self.cross_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.post_attn   = GRN(d_model, H, d_model, dropout)
+
+        # Hurdle: two separate heads
+        self.active_head = nn.Sequential(
+            nn.Linear(d_model, H), nn.ReLU(), nn.Dropout(dropout), nn.Linear(H, 3))
+        self.mag_head    = nn.Sequential(
+            nn.Linear(d_model, H), nn.ReLU(), nn.Dropout(dropout), nn.Linear(H, 3))
+
+    def _hpos(self, B, H, device, dtype):
+        h    = torch.arange(1, H+1, device=device, dtype=dtype)
+        hn   = h / H
+        return torch.stack([hn, torch.sin(2*np.pi*hn), torch.cos(2*np.pi*hn),
+                             (h>=13).float()], -1).view(1,H,4).expand(B,H,4)
+
+    def forward(self, x, ctx, return_aux=False):
+        hist_sel, hw = self.hist_vsn(x)
+        fut_sel,  fw = self.fut_vsn(ctx)
+
+        enc_out, (hn, cn) = self.enc_lstm(hist_sel)   # enc_out: [B,T,D]
+
+        B, H, _ = ctx.shape
+        dec_in  = torch.cat([fut_sel, self._hpos(B, H, ctx.device, ctx.dtype)], -1)
+        dec_out, _ = self.dec_lstm(dec_in, (hn, cn))  # dec_out: [B,H,D]
+
+        # Cross-attention: decoder attends to full encoder history
+        attn_out, attn_w = self.cross_attn(dec_out, enc_out, enc_out, need_weights=True)
+        z = self.post_attn(dec_out + attn_out)         # [B,H,D]
+
+        active_logit = self.active_head(z)             # [B,H,3]  raw logit
+        p_active     = torch.sigmoid(active_logit)     # [B,H,3]
+        log_mag      = F.softplus(self.mag_head(z))    # [B,H,3]
+        log_hat      = p_active * log_mag              # [B,H,3]  gated output
+
+        if return_aux:
+            return {"log_hat": log_hat, "p_active": p_active,
+                    "active_logit": active_logit, "log_mag": log_mag,
+                    "hist_w": hw, "fut_w": fw, "attn_w": attn_w}
+        return log_hat
+
+
+def hurdle_loss(log_hat, true_total, true_buy, true_instock,
+                active_logit, log_mag,
+                w=(0.3, 0.6, 1.0),
+                bce_w=1.0, mag_w=1.0, mean_w=0.2,
+                hor_alpha=0.4, high_alpha=1.0):
+
+    true = torch.stack([true_total.clamp(0), true_buy.clamp(0), true_instock.clamp(0)], -1)
+    tlog = torch.log1p(true)
+    tw   = torch.tensor(w, device=log_hat.device).view(1,1,3)
+
+    # sample weights
+    denom  = tlog.detach().mean((0,1), keepdim=True).clamp_min(1e-6)
+    high_w = 1.0 + high_alpha * tlog.detach() / denom
+    H      = true.shape[1]
+    h      = torch.arange(1, H+1, device=true.device, dtype=true.dtype).view(1,H,1)
+    hor_w  = 1.0 + hor_alpha * (h / H)
+    sw     = high_w * hor_w   # [B,H,3]
+
+    # 1. BCE occurrence
+    alabel   = (true > 0).float()
+    bce      = F.binary_cross_entropy_with_logits(active_logit, alabel, reduction="none")
+    bce_loss = (bce * sw * tw).mean()
+
+    # 2. Magnitude Huber on active cells only
+    mag_err  = F.huber_loss(log_mag, tlog, delta=1.0, reduction="none")
+    mask     = alabel
+    num      = (mag_err * mask * sw * tw).sum()
+    den      = (mask * sw * tw).sum().clamp_min(1.0)
+    mag_loss = num / den
+
+    # 3. Mean scale penalty
+    pl       = torch.expm1(log_hat).clamp(0)
+    mean_loss= (torch.abs(torch.log1p(pl.mean((0,1))) -
+                          torch.log1p(true.mean((0,1)).clamp_min(1e-6))) * tw.view(3)).mean()
+
+    return bce_w * bce_loss + mag_w * mag_loss + mean_w * mean_loss
+
+
+def _predict_hurdle(model, va_ld, funnel=True):
+    rows = []; model.eval()
+    with torch.no_grad():
+        for b in va_ld:
+            aux  = model(b["x"], b["future_ctx"], return_aux=True)
+            pred = torch.expm1(aux["log_hat"]).clamp(0).cpu().numpy()
+            pact = aux["p_active"].cpu().numpy()
+            if funnel:
+                pred[:,:,1] = np.minimum(pred[:,:,1], pred[:,:,0])
+                pred[:,:,2] = np.minimum(pred[:,:,2], pred[:,:,1])
+            B, H = b["future_instock"].shape
+            for i in range(B):
+                for h in range(H):
+                    rows.append({
+                        "asin":            b["asin"][i],
+                        "order_week":      pd.to_datetime(b["target_week"][h][i]),
+                        "horizon":         h + 1,
+                        "true_total_dph":  b["future_total"][i,h].item(),
+                        "pred_total_dph":  pred[i,h,0],
+                        "true_buy_box_dph":b["future_buy"][i,h].item(),
+                        "pred_buy_box_dph":pred[i,h,1],
+                        "true_instock_dph":b["future_instock"][i,h].item(),
+                        "pred_instock_dph":pred[i,h,2],
+                        "true_demand":     b["future_demand"][i,h].item(),
+                        "p_active_total":  pact[i,h,0],
+                        "p_active_buy":    pact[i,h,1],
+                        "p_active_instock":pact[i,h,2],
+                    })
+    return pd.DataFrame(rows)
+
+
+def run_tft_hurdle(data_raw1, scot_df, n_asins=5000, seed=42,
+                   history=52, horizon=20, d_model=64, n_heads=4,
+                   batch_size=64, epochs=60, lr=1e-3, patience=8,
+                   bce_w=1.0, mag_w=1.0, mean_w=0.2, funnel=True):
+
+    print("\n" + "="*80 + "\nPIPELINE B: TFT-HURDLE\n" + "="*80)
+
+    df = prepare_data(data_raw1, scot_df, n_asins, seed)
+    df = filter_extremes(df)
+    asin_data, ctx_dim, ctx_cols = load_data(df)
+    tr_ld, va_ld = make_loaders(asin_data, history, horizon, batch_size)
+
+    input_dim = next(iter(tr_ld))["x"].shape[-1]
+    model = TFTHurdleModel(input_dim, ctx_dim, d_model, horizon, n_heads)
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    def loss_fn(out, t, b, i):
+        # out is log_hat when called from _train_loop — need aux
+        return out   # handled below via custom loop
+
+    # Custom train loop for hurdle (needs return_aux)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs,1))
+    best_val, best_sd, no_imp = float("inf"), None, 0
+
+    for ep in range(epochs):
+        model.train(); tl, tn = 0.0, 0
+        for b in tr_ld:
+            aux  = model(b["x"], b["future_ctx"], return_aux=True)
+            loss = hurdle_loss(aux["log_hat"], b["future_total"], b["future_buy"],
+                               b["future_instock"], aux["active_logit"], aux["log_mag"],
+                               bce_w=bce_w, mag_w=mag_w, mean_w=mean_w)
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+            tl += loss.item() * b["x"].shape[0]; tn += b["x"].shape[0]
+        sch.step()
+
+        model.eval(); vl, vn = 0.0, 0
+        with torch.no_grad():
+            for b in va_ld:
+                aux  = model(b["x"], b["future_ctx"], return_aux=True)
+                loss = hurdle_loss(aux["log_hat"], b["future_total"], b["future_buy"],
+                                   b["future_instock"], aux["active_logit"], aux["log_mag"],
+                                   bce_w=bce_w, mag_w=mag_w, mean_w=mean_w)
+                vl += loss.item() * b["x"].shape[0]; vn += b["x"].shape[0]
+
+        tl /= max(tn,1); vl /= max(vn,1)
+        print(f"[Hurdle] Ep {ep+1:03d} | train={tl:.5f} | val={vl:.5f}")
+
+        if vl < best_val - 1e-6:
+            best_val = vl
+            best_sd  = {k: v.clone() for k, v in model.state_dict().items()}
+            no_imp   = 0
+        else:
+            no_imp += 1
+        if no_imp >= patience:
+            print(f"[Hurdle] Early stop. best_val={best_val:.5f}"); break
+
+    model.load_state_dict(best_sd)
+
+    pred_df = _predict_hurdle(model, va_ld, funnel)
+
+    print("\n--- TFT-Hurdle Evaluation ---")
+    diag = evaluate(pred_df)
+
+    return {
+        "model":    model,
+        "pred_df":  pred_df,
+        "diag":     diag,
+        "exposure_hat": make_exposure_hat(pred_df),
+    }
+
+
+# ============================================================
+# 6. COMPARE
+# ============================================================
+
+def compare_two(result_attn, result_hurdle):
+    """Side-by-side in_stock_dph by horizon."""
+    a = result_attn["diag"]["by_horizon"].copy()
+    a.insert(0, "method", "best_attn")
+    b = result_hurdle["diag"]["by_horizon"].copy()
+    b.insert(0, "method", "tft_hurdle")
+
+    comp = pd.concat([a, b]).sort_values(["horizon","method"])
+    print("\n" + "="*80)
+    print("COMPARISON: IN_STOCK_DPH BY HORIZON")
+    print("="*80)
+    print(comp[["method","horizon","ratio","WAPE","underbias","active_AUC"]].round(4).to_string(index=False))
+    return comp
+
+
+# ============================================================
+# USAGE
 # ============================================================
 #
-# result_hurdle = run_tft_hurdle_exposure_forecast(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=52,
-#     horizon=20,
-#     d_model=64,
-#     n_heads=4,
-#     batch_size=64,
-#     epochs=60,
-#     lr=1e-3,
-#     patience=8,
-#     bce_weight=1.00,    # BCE occurrence loss 权重
-#     mag_weight=1.00,    # magnitude loss 权重
-#     mean_weight=0.20,   # mean scale penalty
-#     apply_funnel_constraint=True,
-# )
+# result_attn   = run_best_attn(data_raw1, scot_df, n_asins=5000)
+# result_hurdle = run_tft_hurdle(data_raw1, scot_df, n_asins=5000)
+# comp          = compare_two(result_attn, result_hurdle)
 #
-# exposure_hat_for_demand = result_hurdle["exposure_hat_for_demand"]
-#
-# # pred_df 里额外有 p_active_total / p_active_buy_box / p_active_instock
-# # 可以用来诊断 occurrence 的预测质量
-# pred_df = result_hurdle["forecast_df"]
-# print(pred_df[["horizon","p_active_instock","true_instock_dph","pred_instock_dph"]].head(40))
+# # Feed into demand model:
+# exposure_hat = result_hurdle["exposure_hat"]   # or result_attn
