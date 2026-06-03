@@ -460,7 +460,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
 # ============================================================
 
 class ExposureDataset(Dataset):
-    def __init__(self, data, history=52, horizon=20, mode="train",
+    def __init__(self, data, history=13, horizon=20, mode="train",
                  val_weeks=20, anchor_decay=0.08):
         self.samples = []
         self.data = data
@@ -493,6 +493,11 @@ class ExposureDataset(Dataset):
         cols = d["context_cols"]
         idx  = {c: i for i, c in enumerate(cols)}
         end  = start + h
+
+        # Freeze dynamic review count at forecast origin to avoid future realized review leakage.
+        # review_count=0 is a useful zero/exposure signal, but future true review_count should not be used.
+        if "log_review_count" in idx and end > 0:
+            fc[:, idx["log_review_count"]] = d["future_context"][end - 1, idx["log_review_count"]]
 
         total   = d["total_dph"]
         buy     = d["buy_box_dph"]
@@ -621,12 +626,92 @@ class CausalConv1d(nn.Module):
         return self.conv(F.pad(x, (self.pad, 0)))
 
 
+class ExposureAwareEncoderSelfAttention(nn.Module):
+    """
+    Sparse / exposure-aware self-attention inside the history encoder.
+
+    It is designed for sparse exposure series:
+      - down-weight all-zero history weeks,
+      - up-weight active / peak weeks from demand and DPH history,
+      - keep residual + layer norm for stability.
+
+    Expected raw input feature indices from load_exposure_data():
+      0 = log1p(demand)
+      2 = log1p(total_dph)
+      3 = log1p(buy_box_dph)
+      4 = log1p(in_stock_dph)
+    """
+    def __init__(self, d_model=64, n_heads=4, dropout=0.15,
+                 zero_penalty=2.0, active_bias=1.0, peak_bias=1.0):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.zero_penalty = zero_penalty
+        self.active_bias = active_bias
+        self.peak_bias = peak_bias
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, enc_out, x_raw):
+        B, T, D = enc_out.shape
+
+        demand_log = x_raw[:, :, 0]
+        total_log = x_raw[:, :, 2]
+        buy_log = x_raw[:, :, 3]
+        instock_log = x_raw[:, :, 4]
+
+        active_score = (
+            (demand_log > 0).float()
+            + (total_log > 0).float()
+            + (buy_log > 0).float()
+            + (instock_log > 0).float()
+        ).clamp(max=1.0)
+
+        peak_level = (
+            torch.expm1(demand_log).clamp(min=0.0)
+            + torch.expm1(total_log).clamp(min=0.0)
+            + torch.expm1(buy_log).clamp(min=0.0)
+            + torch.expm1(instock_log).clamp(min=0.0)
+        )
+        peak_score = torch.sqrt(peak_level + 1e-6)
+        peak_norm = peak_score / (peak_score.max(dim=1, keepdim=True)[0] + 1e-6)
+
+        q = self.q_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(enc_out).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_head)
+
+        key_bias = (
+            self.active_bias * active_score
+            + self.peak_bias * peak_norm
+            - self.zero_penalty * (1.0 - active_score)
+        )
+        scores = scores + key_bias[:, None, None, :]
+
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        out = self.out_proj(out)
+
+        return self.norm(enc_out + out)
+
+
 class HistoryEncoderFull(nn.Module):
     """
     TCN Encoder，输出全序列 [B, T, D]。
-    原版只输出最后一步 h[:,-1,:]，现在保留所有T步。
+    TCN 后可选一层 exposure-aware self-attention，适合 0 很多的 exposure 序列。
     """
-    def __init__(self, input_dim, d_model=64):
+    def __init__(self, input_dim, d_model=64, n_heads=4, dropout=0.15,
+                 use_self_attn=True):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         dilations = [1, 2, 4, 8, 13, 26]
@@ -634,12 +719,20 @@ class HistoryEncoderFull(nn.Module):
             CausalConv1d(d_model, d_model, kernel_size=2, dilation=d)
             for d in dilations
         ])
-        self.norms      = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in dilations])
         self.final_norm = nn.LayerNorm(d_model)
+        self.use_self_attn = use_self_attn
+        self.self_attn = ExposureAwareEncoderSelfAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            zero_penalty=2.0,
+            active_bias=1.0,
+            peak_bias=1.0,
+        ) if use_self_attn else None
 
     def forward(self, x):
-        # x: [B, T, F]
-        h = self.input_proj(x).transpose(1, 2)   # [B, D, T]
+        h = self.input_proj(x).transpose(1, 2)
 
         for conv, norm in zip(self.convs, self.norms):
             z = conv(h)
@@ -649,7 +742,11 @@ class HistoryEncoderFull(nn.Module):
             h = F.gelu(h)
             h = h.transpose(1, 2)
 
-        enc_out = self.final_norm(h.transpose(1, 2))   # [B, T, D] ← 全序列
+        enc_out = self.final_norm(h.transpose(1, 2))
+
+        if self.self_attn is not None:
+            enc_out = self.self_attn(enc_out, x)
+
         return enc_out
 
 
@@ -861,9 +958,16 @@ class ExposureForecastModelV2(nn.Module):
 
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
-                 context_cols=None):
+                 context_cols=None, use_encoder_self_attn=True):
         super().__init__()
-        self.encoder = HistoryEncoderFull(input_dim=input_dim, d_model=d_model)
+        self.encoder = HistoryEncoderFull(
+            input_dim=input_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            use_self_attn=use_encoder_self_attn,
+        )
+        print(f"Encoder exposure-aware self-attn: {use_encoder_self_attn}")
 
         col_idx = {c: i for i, c in enumerate(context_cols)} if context_cols else {}
 
@@ -1309,6 +1413,213 @@ def print_exposure_diagnostics(pred_df):
     return {"model": model_tbl, "by_horizon": by_h}
 
 
+
+# ============================================================
+# Encoder / Decoder diagnostics
+# ============================================================
+
+def diagnose_encoder_decoder_performance(model, va_ld, pred_df=None, max_batches=None):
+    """
+    Quick diagnostic for whether encoder and decoder learned useful signals.
+
+    Encoder checks:
+      - Can h_last classify future active / inactive?
+      - Can h_last predict future 20-week magnitude?
+
+    Decoder checks:
+      - p_active AUC and calibration
+      - active-only magnitude ratio / WAPE
+      - cross-attention entropy / concentration
+    """
+    model.eval()
+
+    h_list = []
+    y_total_list, y_buy_list, y_instock_list = [], [], []
+    p_active_list, log_mag_list, pred_list = [], [], []
+    attn_rows = []
+
+    with torch.no_grad():
+        for bi, b in enumerate(va_ld):
+            if max_batches is not None and bi >= max_batches:
+                break
+
+            x = b["x"]
+            fc = b["future_context"]
+            enc_out = model.encoder(x)
+            h_last = enc_out[:, -1, :]
+            aux = model.decoder(enc_out, fc, return_aux=True)
+
+            pred_level = torch.expm1(aux["log_hat"]).clamp(min=0.0)
+            y_stack = torch.stack([
+                b["future_total_dph"],
+                b["future_buy_box_dph"],
+                b["future_instock_dph"],
+            ], dim=-1)
+
+            h_list.append(h_last.detach().cpu().numpy())
+            y_total_list.append(y_stack[:, :, 0].detach().cpu().numpy())
+            y_buy_list.append(y_stack[:, :, 1].detach().cpu().numpy())
+            y_instock_list.append(y_stack[:, :, 2].detach().cpu().numpy())
+            p_active_list.append(aux["p_active"].detach().cpu().numpy())
+            log_mag_list.append(aux["log_mag"].detach().cpu().numpy())
+            pred_list.append(pred_level.detach().cpu().numpy())
+
+            attn = aux.get("attn_weights", None)
+            if attn is not None:
+                a = attn.detach().cpu().numpy()
+                if a.ndim == 4:
+                    a = a.mean(axis=1)  # [B,H,T]
+                entropy = -(a * np.log(a + 1e-8)).sum(axis=-1)
+                max_w = a.max(axis=-1)
+                argmax_pos = a.argmax(axis=-1)
+                attn_rows.append({
+                    "batch": bi,
+                    "attn_entropy_mean": float(np.mean(entropy)),
+                    "attn_max_weight_mean": float(np.mean(max_w)),
+                    "attn_argmax_mean_pos": float(np.mean(argmax_pos)),
+                    "attn_argmax_p90_pos": float(np.quantile(argmax_pos, 0.90)),
+                })
+
+    h = np.concatenate(h_list, axis=0)
+    y_total = np.concatenate(y_total_list, axis=0)
+    y_buy = np.concatenate(y_buy_list, axis=0)
+    y_instock = np.concatenate(y_instock_list, axis=0)
+    p_active = np.concatenate(p_active_list, axis=0)
+    log_mag = np.concatenate(log_mag_list, axis=0)
+    pred = np.concatenate(pred_list, axis=0)
+
+    target_map = {
+        "total": (y_total, pred[:, :, 0], p_active[:, :, 0], log_mag[:, :, 0]),
+        "buy_box": (y_buy, pred[:, :, 1], p_active[:, :, 1], log_mag[:, :, 1]),
+        "in_stock": (y_instock, pred[:, :, 2], p_active[:, :, 2], log_mag[:, :, 2]),
+    }
+
+    encoder_rows = []
+    try:
+        from sklearn.linear_model import LogisticRegression, Ridge
+        from sklearn.metrics import roc_auc_score, r2_score
+    except Exception:
+        LogisticRegression = None
+        Ridge = None
+        roc_auc_score = None
+        r2_score = None
+
+    for name, (y, _, _, _) in target_map.items():
+        active_any = (y.sum(axis=1) > 0).astype(int)
+        y_sum_log = np.log1p(y.sum(axis=1))
+
+        enc_auc = np.nan
+        enc_r2 = np.nan
+        enc_spearman = np.nan
+
+        if LogisticRegression is not None and len(np.unique(active_any)) == 2:
+            try:
+                clf = LogisticRegression(max_iter=500, C=1.0)
+                clf.fit(h, active_any)
+                enc_auc = roc_auc_score(active_any, clf.predict_proba(h)[:, 1])
+            except Exception:
+                enc_auc = np.nan
+
+        active_mask = y.sum(axis=1) > 0
+        if Ridge is not None and active_mask.sum() >= 20:
+            try:
+                reg = Ridge(alpha=1.0)
+                reg.fit(h[active_mask], y_sum_log[active_mask])
+                pred_sum_log = reg.predict(h[active_mask])
+                enc_r2 = r2_score(y_sum_log[active_mask], pred_sum_log)
+                enc_spearman = _safe_spearman(y_sum_log[active_mask], pred_sum_log)
+            except Exception:
+                enc_r2 = np.nan
+                enc_spearman = np.nan
+
+        encoder_rows.append({
+            "target": name,
+            "future_active_rate": float(active_any.mean()),
+            "encoder_active_AUC_same_val": enc_auc,
+            "encoder_active_sum_R2_same_val": enc_r2,
+            "encoder_active_sum_spearman_same_val": enc_spearman,
+        })
+
+    encoder_diag = pd.DataFrame(encoder_rows)
+
+    decoder_rows = []
+    by_h_rows = []
+
+    for name, (y, p, pa, lm) in target_map.items():
+        y_flat = y.reshape(-1)
+        p_flat = p.reshape(-1)
+        pa_flat = pa.reshape(-1)
+        active_flat = (y_flat > 0).astype(int)
+
+        active_auc = _auc(active_flat, pa_flat)
+        active_mask = y_flat > 0
+
+        decoder_rows.append({
+            "target": name,
+            "true_mean": float(np.mean(y_flat)),
+            "pred_mean": float(np.mean(p_flat)),
+            "pred_true_ratio": float(np.mean(p_flat) / (np.mean(y_flat) + 1e-8)),
+            "p_active_mean": float(np.mean(pa_flat)),
+            "true_active_rate": float(np.mean(active_flat)),
+            "p_active_AUC": active_auc,
+            "active_only_true_mean": float(np.mean(y_flat[active_mask])) if active_mask.sum() else np.nan,
+            "active_only_pred_mean": float(np.mean(p_flat[active_mask])) if active_mask.sum() else np.nan,
+            "active_only_ratio": float(np.mean(p_flat[active_mask]) / (np.mean(y_flat[active_mask]) + 1e-8)) if active_mask.sum() else np.nan,
+            "active_only_WAPE": _wape(y_flat[active_mask], p_flat[active_mask]) if active_mask.sum() else np.nan,
+        })
+
+        H = y.shape[1]
+        for hh in range(H):
+            yh = y[:, hh]
+            ph = p[:, hh]
+            pah = pa[:, hh]
+            active_h = yh > 0
+            by_h_rows.append({
+                "target": name,
+                "horizon": hh + 1,
+                "true_mean": float(np.mean(yh)),
+                "pred_mean": float(np.mean(ph)),
+                "ratio": float(np.mean(ph) / (np.mean(yh) + 1e-8)),
+                "true_active_rate": float(np.mean(active_h)),
+                "p_active_mean": float(np.mean(pah)),
+                "p_active_AUC": _auc(active_h.astype(int), pah),
+                "active_only_ratio": float(np.mean(ph[active_h]) / (np.mean(yh[active_h]) + 1e-8)) if active_h.sum() else np.nan,
+                "active_only_WAPE": _wape(yh[active_h], ph[active_h]) if active_h.sum() else np.nan,
+            })
+
+    decoder_diag = pd.DataFrame(decoder_rows)
+    decoder_by_horizon = pd.DataFrame(by_h_rows)
+    attn_diag = pd.DataFrame(attn_rows)
+
+    print("\n" + "=" * 100)
+    print("ENCODER DIAGNOSTICS: can h_last read occurrence / magnitude?")
+    print("=" * 100)
+    print(encoder_diag.round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("DECODER DIAGNOSTICS: active head + magnitude head")
+    print("=" * 100)
+    print(decoder_diag.round(4).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("DECODER BY HORIZON: IN_STOCK only")
+    print("=" * 100)
+    in_h = decoder_by_horizon[decoder_by_horizon["target"] == "in_stock"]
+    print(in_h.round(4).to_string(index=False))
+
+    if len(attn_diag) > 0:
+        print("\n" + "=" * 100)
+        print("CROSS-ATTENTION DIAGNOSTICS")
+        print("=" * 100)
+        print(attn_diag.round(4).to_string(index=False))
+
+    return {
+        "encoder_diag": encoder_diag,
+        "decoder_diag": decoder_diag,
+        "decoder_by_horizon": decoder_by_horizon,
+        "attn_diag": attn_diag,
+    }
+
 def make_external_hat_df(pred_df):
     out = pred_df[["asin", "order_week", "pred_total_dph", "pred_buy_box_dph", "pred_instock_dph"]].copy()
     out["external_total_dph_hat_log"]    = np.log1p(out["pred_total_dph"].clip(lower=0.0))
@@ -1326,7 +1637,7 @@ def run_exposure_v2(
     scot_df=None,    # 不再使用，保留接口兼容
     n_asins=5000,
     seed=42,
-    history=52,
+    history=13,
     horizon=20,
     d_model=48,      # 64→48，减少参数防过拟合
     n_heads=4,
@@ -1345,6 +1656,7 @@ def run_exposure_v2(
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
+    use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: TCN Full-Seq Encoder + Cross-Attn + Hurdle")
@@ -1376,6 +1688,7 @@ def run_exposure_v2(
         n_heads=n_heads,
         dropout=dropout,
         context_cols=context_cols,
+        use_encoder_self_attn=use_encoder_self_attn,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -1390,6 +1703,8 @@ def run_exposure_v2(
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
+    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
+    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     exposure_hat_for_demand = make_external_hat_df(pred_df)
 
     return {
@@ -1414,7 +1729,7 @@ def run_exposure_v2(
 #     scot_df=scot_df,
 #     n_asins=5000,
 #     seed=42,
-#     history=52,
+#     history=13,
 #     horizon=20,
 #     d_model=64,
 #     n_heads=4,
@@ -1433,3 +1748,522 @@ def run_exposure_v2(
 #
 # # 诊断occurrence预测质量
 # print(pred_df.groupby("horizon")["p_active_instock"].mean())
+
+# ============================================================
+# Rolling Backtest + SCOT Intersection Add-on
+# Added after original definitions; these functions override/use the fixed ABC model above.
+# ============================================================
+
+def prepare_data_from_sample_scot_intersection(
+    data_raw1,
+    scot_df=None,
+    n_asins=5000,
+    seed=42,
+):
+    df = data_raw1.copy()
+    df["asin"] = df["asin"].astype(str)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+
+    rng = np.random.default_rng(seed)
+    unique_asins = df["asin"].dropna().unique()
+    sample_asins = rng.choice(
+        unique_asins,
+        size=min(n_asins, len(unique_asins)),
+        replace=False,
+    )
+    sample_asin_set = set(sample_asins)
+
+    if scot_df is None:
+        out = df[df["asin"].isin(sample_asin_set)].copy()
+        print(f"Sampled ASINs: {len(sample_asin_set)} | Rows: {len(out)}")
+        return out
+
+    scot = scot_df.copy()
+    scot["asin"] = scot["asin"].astype(str)
+    scot_asin_set = set(scot["asin"].dropna().unique())
+    intersect_asins = sorted(sample_asin_set & scot_asin_set)
+
+    out = df[df["asin"].isin(intersect_asins)].copy()
+    print("\n" + "=" * 100)
+    print("SAMPLE + SCOT INTERSECTION")
+    print("=" * 100)
+    print(f"Sample ASINs: {len(sample_asin_set)}")
+    print(f"SCOT ASINs: {len(scot_asin_set)}")
+    print(f"Intersection ASINs: {len(intersect_asins)}")
+    print(f"Rows after intersection: {len(out)}")
+    print("=" * 100)
+    return out
+
+
+class ExposureDatasetRolling(Dataset):
+    def __init__(
+        self,
+        data,
+        history=13,
+        horizon=20,
+        mode="train",
+        val_start_offset=0,
+        anchor_decay=0.08,
+    ):
+        self.samples = []
+        self.data = data
+        self.history = history
+        self.horizon = horizon
+        self.anchor_decay = anchor_decay
+        self.val_start_offset = int(val_start_offset)
+
+        for asin, d in data.items():
+            T = len(d["features"])
+            val_start = T - history - horizon - self.val_start_offset
+
+            if mode == "train":
+                starts = range(max(0, val_start))
+            else:
+                starts = [val_start] if val_start >= 0 and (val_start + history + horizon) <= T else []
+
+            for start in starts:
+                self.samples.append((asin, start))
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _hist_mean(arr, end, window):
+        x = arr[max(0, end - window):end]
+        return float(np.mean(x)) if len(x) > 0 else 0.0
+
+    def _make_future_context(self, d, start):
+        h = self.history
+        H = self.horizon
+        fc = d["future_context"][start + h:start + h + H].copy()
+        cols = d["context_cols"]
+        idx = {c: i for i, c in enumerate(cols)}
+        end = start + h
+
+        total = d["total_dph"]
+        buy = d["buy_box_dph"]
+        instock = d["in_stock_dph"]
+        demand = d["demand"]
+
+        post_event_col = "post_event_decay"
+        current_post_decay = float(fc[0, idx[post_event_col]]) if post_event_col in idx and len(fc) > 0 else 0.0
+        post_strength = 0.5
+        effective_post_decay = post_strength * current_post_decay
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            for prefix, arr in [("total", total), ("buy_box", buy), ("instock", instock)]:
+                mean13_val = np.log1p(self._hist_mean(arr, end, 13))
+                mean4_val = np.log1p(self._hist_mean(arr, end, 4))
+                raw_last = np.log1p(arr[end - 1]) if end > 0 else 0.0
+                last_val = raw_last * (1.0 - effective_post_decay) + mean13_val * effective_post_decay
+
+                for col, val in [
+                    (f"hist_{prefix}_dph_last_log", h_decay * last_val + (1 - h_decay) * mean13_val),
+                    (f"hist_{prefix}_dph_mean4_log", h_decay * mean4_val + (1 - h_decay) * mean13_val),
+                    (f"hist_{prefix}_dph_mean13_log", mean13_val),
+                ]:
+                    if col in idx:
+                        fc[step_h, idx[col]] = val
+
+        demand_last = np.log1p(demand[end - 1]) if end > 0 else 0.0
+        demand_mean4 = np.log1p(self._hist_mean(demand, end, 4))
+        demand_mean13 = np.log1p(self._hist_mean(demand, end, 13))
+        demand_active_rate = float(np.mean(demand[max(0, end - 13):end] > 0)) if end > 0 else 0.0
+
+        for step_h in range(H):
+            h_decay = np.exp(-self.anchor_decay * step_h)
+            for col, val in [
+                ("hist_demand_last_log", h_decay * demand_last + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean4_log", h_decay * demand_mean4 + (1 - h_decay) * demand_mean13),
+                ("hist_demand_mean13_log", demand_mean13),
+                ("hist_demand_active_rate", demand_active_rate),
+            ]:
+                if col in idx:
+                    fc[step_h, idx[col]] = val
+
+        return fc
+
+    def __getitem__(self, i):
+        asin, start = self.samples[i]
+        d = self.data[asin]
+        h = self.history
+        H = self.horizon
+
+        return {
+            "asin": asin,
+            "target_week": [str(w)[:10] for w in d["week"][start + h:start + h + H]],
+            "x": torch.tensor(d["features"][start:start + h], dtype=torch.float32),
+            "future_context": torch.tensor(self._make_future_context(d, start), dtype=torch.float32),
+            "future_total_dph": torch.tensor(d["total_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_buy_box_dph": torch.tensor(d["buy_box_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_instock_dph": torch.tensor(d["in_stock_dph"][start + h:start + h + H], dtype=torch.float32),
+            "future_demand": torch.tensor(d["demand"][start + h:start + h + H], dtype=torch.float32),
+        }
+
+
+def summarize_rolling_exposure(pred_df, label="ROLLING"):
+    print("\n" + "=" * 100)
+    print(f"{label}: OVERALL METRICS")
+    print("=" * 100)
+    tbl = exposure_metrics(pred_df, prefix="pred")
+    print(tbl.round(5).to_string(index=False))
+
+    rows = []
+    for (offset, h), g in pred_df.groupby(["backtest_offset", "horizon"]):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows.append({
+            "backtest_offset": offset,
+            "horizon": h,
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_offset_horizon = pd.DataFrame(rows)
+
+    rows2 = []
+    for offset, g in pred_df.groupby("backtest_offset"):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows2.append({
+            "backtest_offset": offset,
+            "n_rows": len(g),
+            "n_asins": g["asin"].nunique(),
+            "true_mean": np.mean(y),
+            "pred_mean": np.mean(p),
+            "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE": _wape(y, p),
+            "underbias": np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias": np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr": _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_offset = pd.DataFrame(rows2)
+
+    print("\n" + "=" * 100)
+    print(f"{label}: BY BACKTEST OFFSET")
+    print("=" * 100)
+    print(by_offset.round(5).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print(f"{label}: BY OFFSET + HORIZON")
+    print("=" * 100)
+    print(by_offset_horizon.round(4).to_string(index=False))
+
+    return {"overall": tbl, "by_offset": by_offset, "by_offset_horizon": by_offset_horizon}
+
+
+def _train_one_exposure_window(
+    data,
+    context_dim,
+    context_cols,
+    history=13,
+    horizon=20,
+    val_start_offset=0,
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=20,
+    lr=5e-4,
+    patience=5,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.30,
+    mag_weight=1.50,
+    mean_weight=0.30,
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+    dropout=0.20,
+    use_encoder_self_attn=True,
+):
+    tr_ds = ExposureDatasetRolling(
+        data,
+        history=history,
+        horizon=horizon,
+        mode="train",
+        val_start_offset=val_start_offset,
+        anchor_decay=anchor_decay,
+    )
+    va_ds = ExposureDatasetRolling(
+        data,
+        history=history,
+        horizon=horizon,
+        mode="val",
+        val_start_offset=val_start_offset,
+        anchor_decay=anchor_decay,
+    )
+
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, collate_fn=exposure_collate)
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=exposure_collate)
+
+    print("\n" + "=" * 100)
+    print(f"BACKTEST OFFSET = {val_start_offset}")
+    print("=" * 100)
+    print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
+
+    if len(tr_ds) == 0 or len(va_ds) == 0:
+        raise ValueError(f"Empty train/val set for val_start_offset={val_start_offset}")
+
+    input_dim = next(iter(tr_ld))["x"].shape[-1]
+    model = ExposureForecastModelV2(
+        input_dim=input_dim,
+        context_dim=context_dim,
+        d_model=d_model,
+        horizon=horizon,
+        n_heads=n_heads,
+        dropout=dropout,
+        context_cols=context_cols,
+        use_encoder_self_attn=use_encoder_self_attn,
+    )
+    print(f"Input dim: {input_dim} | Context dim: {context_dim}")
+    print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    train_exposure_model_v2(
+        model=model,
+        tr_ld=tr_ld,
+        va_ld=va_ld,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
+        bce_weight=bce_weight,
+        mag_weight=mag_weight,
+        mean_weight=mean_weight,
+        horizon_weight_alpha=horizon_weight_alpha,
+        high_weight_alpha=high_weight_alpha,
+    )
+
+    pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
+    pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
+    pred_df["backtest_offset"] = int(val_start_offset)
+
+    diagnostics = print_exposure_diagnostics(pred_df)
+    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
+    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
+    return {
+        "model": model,
+        "forecast_df": pred_df,
+        "diagnostics": diagnostics,
+        "tr_ld": tr_ld,
+        "va_ld": va_ld,
+        "tr_ds": tr_ds,
+        "va_ds": va_ds,
+    }
+
+
+def run_exposure_v2(
+    data_raw1,
+    scot_df=None,
+    n_asins=5000,
+    seed=42,
+    history=13,
+    horizon=20,
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=20,
+    lr=5e-4,
+    patience=5,
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.30,
+    mag_weight=1.50,
+    mean_weight=0.30,
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+    dropout=0.20,
+    use_scot_intersection=True,
+    val_start_offset=0,
+    use_encoder_self_attn=True,
+):
+    print("\n" + "=" * 100)
+    print("EXPOSURE MODEL V2: SINGLE WINDOW + SCOT OPTION")
+    print("=" * 100)
+
+    if use_scot_intersection:
+        df = prepare_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+    else:
+        df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
+
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+
+    out = _train_one_exposure_window(
+        data=data,
+        context_dim=context_dim,
+        context_cols=context_cols,
+        history=history,
+        horizon=horizon,
+        val_start_offset=val_start_offset,
+        d_model=d_model,
+        n_heads=n_heads,
+        batch_size=batch_size,
+        epochs=epochs,
+        lr=lr,
+        patience=patience,
+        apply_funnel_constraint=apply_funnel_constraint,
+        anchor_decay=anchor_decay,
+        bce_weight=bce_weight,
+        mag_weight=mag_weight,
+        mean_weight=mean_weight,
+        horizon_weight_alpha=horizon_weight_alpha,
+        high_weight_alpha=high_weight_alpha,
+        dropout=dropout,
+    )
+
+    pred_df = out["forecast_df"]
+    out.update({
+        "exposure_hat_for_demand": make_external_hat_df(pred_df),
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "source_df": df,
+    })
+    return out
+
+
+def run_exposure_v2_rolling(
+    data_raw1,
+    scot_df=None,
+    n_asins=1000,
+    seed=42,
+    history=13,
+    horizon=20,
+    rolling_offsets=(60, 40, 20, 0),
+    d_model=48,
+    n_heads=4,
+    batch_size=128,
+    epochs=20,
+    lr=5e-4,
+    patience=5,
+    dph_cap_q=0.995,
+    remove_extreme=True,
+    extreme_q=0.99,
+    apply_funnel_constraint=True,
+    anchor_decay=0.08,
+    bce_weight=0.30,
+    mag_weight=1.50,
+    mean_weight=0.30,
+    horizon_weight_alpha=0.40,
+    high_weight_alpha=1.00,
+    dropout=0.20,
+    use_scot_intersection=True,
+    use_encoder_self_attn=True,
+):
+    print("\n" + "=" * 100)
+    print("EXPOSURE MODEL V2: ROLLING BACKTEST + SCOT INTERSECTION")
+    print("=" * 100)
+    print(f"n_asins={n_asins} | history={history} | rolling_offsets={list(rolling_offsets)} | epochs={epochs} | patience={patience} | encoder_attn={use_encoder_self_attn}")
+
+    if use_scot_intersection:
+        df = prepare_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+    else:
+        df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
+
+    if remove_extreme:
+        df = filter_extreme_asins(df, q=extreme_q)
+
+    data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
+
+    results_by_offset = {}
+    pred_list = []
+
+    for offset in rolling_offsets:
+        try:
+            res = _train_one_exposure_window(
+                data=data,
+                context_dim=context_dim,
+                context_cols=context_cols,
+                history=history,
+                horizon=horizon,
+                val_start_offset=int(offset),
+                d_model=d_model,
+                n_heads=n_heads,
+                batch_size=batch_size,
+                epochs=epochs,
+                lr=lr,
+                patience=patience,
+                apply_funnel_constraint=apply_funnel_constraint,
+                anchor_decay=anchor_decay,
+                bce_weight=bce_weight,
+                mag_weight=mag_weight,
+                mean_weight=mean_weight,
+                horizon_weight_alpha=horizon_weight_alpha,
+                high_weight_alpha=high_weight_alpha,
+                dropout=dropout,
+                use_encoder_self_attn=use_encoder_self_attn,
+            )
+            results_by_offset[int(offset)] = res
+            pred_list.append(res["forecast_df"])
+        except Exception as e:
+            print(f"[SKIP] offset={offset} failed: {e}")
+
+    if len(pred_list) == 0:
+        raise RuntimeError("All rolling backtest windows failed.")
+
+    rolling_pred_df = pd.concat(pred_list, ignore_index=True)
+    rolling_diagnostics = summarize_rolling_exposure(rolling_pred_df, label="ROLLING BACKTEST")
+
+    latest_offset = 0 if 0 in results_by_offset else sorted(results_by_offset.keys())[-1]
+    latest_pred_df = results_by_offset[latest_offset]["forecast_df"]
+
+    return {
+        "results_by_offset": results_by_offset,
+        "rolling_forecast_df": rolling_pred_df,
+        "forecast_df": latest_pred_df,
+        "diagnostics": rolling_diagnostics,
+        "exposure_hat_for_demand": make_external_hat_df(latest_pred_df),
+        "context_cols": context_cols,
+        "context_dim": context_dim,
+        "data": data,
+        "source_df": df,
+        "rolling_offsets": list(rolling_offsets),
+    }
+
+
+# ============================================================
+# Usage
+# ============================================================
+# Fast rolling + SCOT intersection:
+#
+# result_roll = run_exposure_v2_rolling(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=1000,
+#     seed=42,
+#     history=13,
+#     horizon=20,
+#     rolling_offsets=(60, 40, 20, 0),
+#     epochs=20,
+#     patience=5,
+#     batch_size=128,
+#     use_scot_intersection=True,
+# )
+#
+# rolling_pred_df = result_roll["rolling_forecast_df"]
+# pred_df = result_roll["forecast_df"]                 # latest offset, usually offset=0
+# exposure_hat_for_demand = result_roll["exposure_hat_for_demand"]
+#
+# Single latest window + SCOT intersection:
+#
+# result = run_exposure_v2(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     n_asins=3000,
+#     seed=42,
+#     history=13,
+#     horizon=20,
+#     epochs=60,
+#     patience=10,
+#     use_scot_intersection=True,
+# )
