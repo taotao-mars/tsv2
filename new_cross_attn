@@ -388,18 +388,55 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         # ── encoder历史特征（9维→11维）─────────────────────
         # 新增：log_review_count（mag信号）, ind_promotion（active信号）
         week_idx = np.arange(len(g))
+
+        # ── 月份/季节特征 ─────────────────────────────────────
+        month_sin  = np.sin(2 * np.pi * g["month_sin"].values).astype(np.float32)
+        month_cos  = np.cos(2 * np.pi * g["month_cos"].values).astype(np.float32)
+        season_w   = g["season_winter"].values.astype(np.float32)
+        season_su  = g["season_summer"].values.astype(np.float32)
+
+        # ── 절假日/事件特征（如果存在）───────────────────────
+        is_event   = g["is_event_window"].values.astype(np.float32) \
+                     if "is_event_window" in g.columns else np.zeros(len(g), dtype=np.float32)
+        pre_event  = g["pre_event_proximity"].values.astype(np.float32) \
+                     if "pre_event_proximity" in g.columns else np.zeros(len(g), dtype=np.float32)
+        post_event = g["post_event_decay"].values.astype(np.float32) \
+                     if "post_event_decay" in g.columns else np.zeros(len(g), dtype=np.float32)
+        ind_prime  = g["ind_prime_week"].values.astype(np.float32) \
+                     if "ind_prime_week" in g.columns else np.zeros(len(g), dtype=np.float32)
+
+        # ── GL静态特征（每周重复同一个值）─────────────────────
+        # 让encoder学到不同GL在不同季节/月份的DPH规律
+        # TCN会自动学 GL×季节 的交互，不需要手动写交叉特征
+        gl_code = g["stock_static__gl_product_group__code"].values.astype(np.float32) \
+                  if "stock_static__gl_product_group__code" in g.columns \
+                  else np.zeros(len(g), dtype=np.float32)
+        gl_freq = g["stock_static__gl_product_group__freq"].values.astype(np.float32) \
+                  if "stock_static__gl_product_group__freq" in g.columns \
+                  else np.zeros(len(g), dtype=np.float32)
+
+        # ── encoder历史特征（17→19维）─────────────────────────
         features = np.stack([
-            np.log1p(demand),                          # 历史需求
-            (demand > 0).astype(float),                # 需求active
-            np.log1p(total),                           # 历史total_dph
-            np.log1p(buy),                             # 历史buy_box_dph
-            np.log1p(instock),                         # 历史instock_dph
-            price_log_norm,                            # 全局log归一化价格
-            oos,                                       # 缺货信号
-            np.sin(2 * np.pi * week_idx / 52.0),      # 年内周期
-            np.cos(2 * np.pi * week_idx / 52.0),
-            g["log_review_count"].values.astype(np.float32),   # 新增：评论数
-            g["ind_promotion"].values.astype(np.float32),      # 新增：促销标记
+            np.log1p(demand),                               # 历史需求
+            (demand > 0).astype(float),                     # 需求active
+            np.log1p(total),                                # 历史total_dph
+            np.log1p(buy),                                  # 历史buy_box_dph
+            np.log1p(instock),                              # 历史instock_dph
+            price_log_norm,                                 # 全局log归一化价格
+            oos,                                            # 缺货信号
+            np.sin(2 * np.pi * week_idx / 52.0),           # 年内周期sin
+            np.cos(2 * np.pi * week_idx / 52.0),           # 年内周期cos
+            g["log_review_count"].values.astype(np.float32),  # 评论数
+            g["ind_promotion"].values.astype(np.float32),     # 促销标记
+            month_sin,    # 月份sin
+            month_cos,    # 月份cos
+            season_w,     # 冬季（感恩节/圣诞）
+            season_su,    # 夏季（PrimeDay/户外）
+            pre_event,    # 节假日临近程度
+            post_event,   # 节假日后衰减
+            # ── 新增：GL品类（让encoder学GL×季节交互）────────
+            gl_code,      # GL编码（办公/园艺/家具等）
+            gl_freq,      # GL频率（品类大小）
         ], axis=1).astype(np.float32)
 
         data[asin] = {
@@ -413,7 +450,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
             "context_cols":   context_cols,
         }
 
-    print(f"ASINs: {len(data)} | Context dim: {len(context_cols)} | Encoder dim: 11")
+    print(f"ASINs: {len(data)} | Context dim: {len(context_cols)} | Encoder dim: 19")
     return data, len(context_cols), context_cols
 
 
