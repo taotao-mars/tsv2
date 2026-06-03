@@ -1,50 +1,50 @@
-import numpy as np
-import pandas as pd
-
-def check_dph_lag_correlation(
+def check_history_window_baselines(
     df,
-    targets=("total_dph", "buy_box_dph", "in_stock_dph"),
+    target="in_stock_dph",
     asin_col="asin",
     week_col="order_week",
-    lags=(1, 2, 4, 8, 13, 26, 52),
-    min_weeks=80,
+    horizon=20,
+    windows=(4, 8, 13, 26, 52),
 ):
     d = df.copy()
     d[asin_col] = d[asin_col].astype(str)
     d[week_col] = pd.to_datetime(d[week_col])
+    d[target] = pd.to_numeric(d[target], errors="coerce").fillna(0.0).clip(lower=0.0)
     d = d.sort_values([asin_col, week_col])
 
     rows = []
 
-    for target in targets:
-        d[target] = pd.to_numeric(d[target], errors="coerce").fillna(0.0).clip(lower=0.0)
+    for w in windows:
+        y_all = []
+        p_all = []
 
-        for lag in lags:
-            corrs = []
+        for asin, g in d.groupby(asin_col):
+            if len(g) < w + horizon:
+                continue
 
-            for asin, g in d.groupby(asin_col):
-                if len(g) < max(min_weeks, lag + 10):
-                    continue
+            y = g[target].values.astype(float)
+            hist = y[-horizon-w:-horizon]
+            true = y[-horizon:]
 
-                y = np.log1p(g[target].values.astype(float))
-                y1 = y[lag:]
-                y0 = y[:-lag]
+            pred = np.repeat(np.mean(hist), horizon)
 
-                if np.std(y1) < 1e-8 or np.std(y0) < 1e-8:
-                    continue
+            y_all.append(true)
+            p_all.append(pred)
 
-                corrs.append(np.corrcoef(y1, y0)[0, 1])
+        y_all = np.concatenate(y_all)
+        p_all = np.concatenate(p_all)
 
-            rows.append({
-                "target": target,
-                "lag": lag,
-                "mean_corr": np.nanmean(corrs) if len(corrs) else np.nan,
-                "median_corr": np.nanmedian(corrs) if len(corrs) else np.nan,
-                "n_asins": len(corrs),
-            })
+        rows.append({
+            "window": w,
+            "true_mean": y_all.mean(),
+            "pred_mean": p_all.mean(),
+            "ratio": p_all.mean() / (y_all.mean() + 1e-8),
+            "WAPE": np.abs(y_all - p_all).sum() / (np.abs(y_all).sum() + 1e-8),
+            "corr": np.corrcoef(y_all, p_all)[0, 1] if np.std(p_all) > 1e-8 and np.std(y_all) > 1e-8 else np.nan,
+        })
 
     out = pd.DataFrame(rows)
-    display(out.pivot(index="lag", columns="target", values="median_corr").round(4))
+    display(out.round(4))
     return out
 
-lag_corr_df = check_dph_lag_correlation(data_raw1)
+baseline_window_df = check_history_window_baselines(data_raw1, target="in_stock_dph")
