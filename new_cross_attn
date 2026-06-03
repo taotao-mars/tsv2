@@ -65,25 +65,40 @@ def _auc(y_binary, score):
 # 数据加载（不变，完整保留）
 # ============================================================
 
-def prepare_data_from_sample_scot_intersection(
-    data_raw1, scot_df, n_asins=5000, seed=42,
+def prepare_data_from_sample(
+    data_raw1, scot_df=None, n_asins=5000, seed=42,
 ):
+    """
+    直接从data_raw1采样n_asins个ASIN，不再做SCOT intersection。
+
+    原因：SCOT intersection把5000个ASIN压缩到~3000，
+    减少了训练样本量，增加了过拟合风险。
+    现在直接用5000个ASIN，数据量更大，泛化更好。
+
+    scot_df参数保留但不使用，保持接口兼容。
+    """
     df = data_raw1.copy()
-    scot = scot_df.copy()
     df["asin"] = df["asin"].astype(str)
-    scot["asin"] = scot["asin"].astype(str)
     df["order_week"] = pd.to_datetime(df["order_week"])
 
     rng = np.random.default_rng(seed)
     unique_asins = df["asin"].dropna().unique()
-    sample_asins = rng.choice(unique_asins, size=min(n_asins, len(unique_asins)), replace=False)
+    sample_asins = rng.choice(
+        unique_asins,
+        size=min(n_asins, len(unique_asins)),
+        replace=False,
+    )
 
-    sample_asin_set = set(sample_asins)
-    scot_asin_set = set(scot["asin"].dropna().unique())
-    intersect_asins = sorted(sample_asin_set & scot_asin_set)
+    out = df[df["asin"].isin(set(sample_asins))].copy()
+    print(f"Sampled ASINs: {len(sample_asins)} | Rows: {len(out)}")
+    return out
 
-    print(f"Sample ASINs: {len(sample_asin_set)} | SCOT ASINs: {len(scot_asin_set)} | Intersection: {len(intersect_asins)}")
-    return df[df["asin"].isin(intersect_asins)].copy()
+
+# 向后兼容：保留旧函数名
+def prepare_data_from_sample_scot_intersection(
+    data_raw1, scot_df=None, n_asins=5000, seed=42,
+):
+    return prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
 
 
 def filter_extreme_asins(data_raw, q=0.99):
@@ -763,6 +778,7 @@ class ExposureForecastModelV2(nn.Module):
         "ind_promotion",
         "ind_prime_week",
         "stock_static__ind_new_asin",
+        "log_review_count",        # 新增：review高→active率高（零值率从75%降到22%）
         "order_month", "month_sin", "month_cos",
         "season_winter", "season_spring", "season_summer", "season_fall",
         "is_event_window", "weeks_to_nearest_event", "abs_weeks_to_nearest_event",
@@ -1249,17 +1265,17 @@ def make_external_hat_df(pred_df):
 
 def run_exposure_v2(
     data_raw1,
-    scot_df,
+    scot_df=None,    # 不再使用，保留接口兼容
     n_asins=5000,
     seed=42,
     history=52,
     horizon=20,
-    d_model=64,
+    d_model=48,      # 64→48，减少参数防过拟合
     n_heads=4,
     batch_size=64,
-    epochs=60,
-    lr=1e-3,
-    patience=8,
+    epochs=80,       # 60→80，给模型更多时间
+    lr=5e-4,         # 1e-3→5e-4，更稳定
+    patience=15,     # 8→15，避免过早停止
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -1270,12 +1286,13 @@ def run_exposure_v2(
     mean_weight=0.30,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
+    dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: TCN Full-Seq Encoder + Cross-Attn + Hurdle")
     print("=" * 100)
 
-    df = prepare_data_from_sample_scot_intersection(data_raw1, scot_df, n_asins, seed)
+    df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
 
@@ -1299,8 +1316,8 @@ def run_exposure_v2(
         d_model=d_model,
         horizon=horizon,
         n_heads=n_heads,
-        dropout=0.10,
-        context_cols=context_cols,   # ← 传入context_cols，让模型找到mean13的index
+        dropout=dropout,
+        context_cols=context_cols,
     )
     print(f"Input dim: {input_dim} | Context dim: {context_dim}")
     print(f"Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
