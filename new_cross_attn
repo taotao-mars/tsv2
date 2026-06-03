@@ -2066,9 +2066,9 @@ def run_exposure_v2(
     d_model=48,
     n_heads=4,
     batch_size=128,
-    epochs=20,
+    epochs=30,
     lr=5e-4,
-    patience=5,
+    patience=6,
     dph_cap_q=0.995,
     remove_extreme=True,
     extreme_q=0.99,
@@ -2119,6 +2119,7 @@ def run_exposure_v2(
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         dropout=dropout,
+        use_encoder_self_attn=use_encoder_self_attn,
     )
 
     pred_df = out["forecast_df"]
@@ -2231,16 +2232,82 @@ def run_exposure_v2_rolling(
     }
 
 
+
+
+def run_exposure_v2_final_scot_5000(
+    data_raw1,
+    scot_df,
+    seed=42,
+    history=13,
+    horizon=20,
+    epochs=30,
+    patience=6,
+    batch_size=128,
+    use_encoder_self_attn=True,
+):
+    """
+    Final single-window setup:
+      - sample 5000 ASINs
+      - intersect with SCOT ASINs
+      - train on sliding windows before the final holdout
+      - validate/predict the latest 20-week window only
+      - return exposure_hat_for_demand for the demand model
+    """
+    return run_exposure_v2(
+        data_raw1=data_raw1,
+        scot_df=scot_df,
+        n_asins=5000,
+        seed=seed,
+        history=history,
+        horizon=horizon,
+        epochs=epochs,
+        patience=patience,
+        batch_size=batch_size,
+        use_scot_intersection=True,
+        val_start_offset=0,
+        use_encoder_self_attn=use_encoder_self_attn,
+    )
+
 # ============================================================
 # Usage
 # ============================================================
-# Fast rolling + SCOT intersection:
+# Final setup: 5000 sample + SCOT intersection + latest 20-week holdout.
+# Training samples are sliding windows; validation/test is the final 20-week window.
 #
+# %run -i tcn_exposure_v2_final_scot5000_h13_encoder_attn_diag.py
+#
+# result = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#     use_encoder_self_attn=True,
+# )
+#
+# pred_df = result["forecast_df"]
+# exposure_hat_for_demand = result["exposure_hat_for_demand"]
+# diagnostics = result["diagnostics"]
+#
+# Optional no-attention ablation:
+# result_no_attn = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#     use_encoder_self_attn=False,
+# )
+#
+# Rolling backtest is still available for robustness checks:
 # result_roll = run_exposure_v2_rolling(
 #     data_raw1=data_raw1,
 #     scot_df=scot_df,
-#     n_asins=1000,
-#     seed=42,
+#     n_asins=5000,
 #     history=13,
 #     horizon=20,
 #     rolling_offsets=(60, 40, 20, 0),
@@ -2248,22 +2315,5 @@ def run_exposure_v2_rolling(
 #     patience=5,
 #     batch_size=128,
 #     use_scot_intersection=True,
-# )
-#
-# rolling_pred_df = result_roll["rolling_forecast_df"]
-# pred_df = result_roll["forecast_df"]                 # latest offset, usually offset=0
-# exposure_hat_for_demand = result_roll["exposure_hat_for_demand"]
-#
-# Single latest window + SCOT intersection:
-#
-# result = run_exposure_v2(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=3000,
-#     seed=42,
-#     history=13,
-#     horizon=20,
-#     epochs=60,
-#     patience=10,
-#     use_scot_intersection=True,
+#     use_encoder_self_attn=True,
 # )
