@@ -390,8 +390,8 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         week_idx = np.arange(len(g))
 
         # ── 月份/季节特征 ─────────────────────────────────────
-        month_sin  = np.sin(2 * np.pi * g["month_sin"].values).astype(np.float32)
-        month_cos  = np.cos(2 * np.pi * g["month_cos"].values).astype(np.float32)
+        month_sin  = g["month_sin"].values.astype(np.float32)
+        month_cos  = g["month_cos"].values.astype(np.float32)
         season_w   = g["season_winter"].values.astype(np.float32)
         season_su  = g["season_summer"].values.astype(np.float32)
 
@@ -531,9 +531,11 @@ class ExposureDataset(Dataset):
                 # 注意：post_decay越大说明越靠近节假日，此时反而需要校正
                 # 感恩节后1周: post_decay≈0.86 → last_val被压向mean13
                 # 正常周:       post_decay≈0.05 → last_val基本不变
+                post_strength = 0.5
+                effective_post_decay = post_strength * current_post_decay
                 last_val = (
-                    raw_last * (1.0 - current_post_decay)
-                    + mean13_val * current_post_decay
+                    raw_last * (1.0 - effective_post_decay)
+                    + mean13_val * effective_post_decay
                 )
 
                 key_map = {
@@ -584,6 +586,25 @@ class ExposureDataset(Dataset):
             "future_instock_dph":  torch.tensor(d["in_stock_dph"][start+h:start+h+H], dtype=torch.float32),
             "future_demand":       torch.tensor(d["demand"][start+h:start+h+H],        dtype=torch.float32),
         }
+
+
+# ============================================================
+# Collate function: keep target_week as [B][H]
+# ============================================================
+
+def exposure_collate(batch):
+    tensor_keys = [
+        "x",
+        "future_context",
+        "future_total_dph",
+        "future_buy_box_dph",
+        "future_instock_dph",
+        "future_demand",
+    ]
+    out = {k: torch.stack([b[k] for b in batch], dim=0) for k in tensor_keys}
+    out["asin"] = [b["asin"] for b in batch]
+    out["target_week"] = [b["target_week"] for b in batch]
+    return out
 
 
 # ============================================================
@@ -1079,7 +1100,7 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True):
                 for h in range(H):
                     rows.append({
                         "asin":              b["asin"][i],
-                        "order_week":        pd.to_datetime(b["target_week"][h][i]),
+                        "order_week":        pd.to_datetime(b["target_week"][i][h]),
                         "horizon":           h + 1,
                         "true_total_dph":    b["future_total_dph"][i, h].item(),
                         "pred_total_dph":    pred[i, h, 0],
@@ -1136,7 +1157,7 @@ def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
         B, H, _ = fc.shape
         for i in range(B):
             for h in range(H):
-                row = {"asin": b["asin"][i], "order_week": pd.to_datetime(b["target_week"][h][i]), "horizon": h + 1}
+                row = {"asin": b["asin"][i], "order_week": pd.to_datetime(b["target_week"][i][h]), "horizon": h + 1}
                 for mode, cols in modes.items():
                     row[f"pred_total_dph_{mode}"]   = np.expm1(fc[i, h, idx[cols["total"]]])
                     row[f"pred_buy_box_dph_{mode}"] = np.expm1(fc[i, h, idx[cols["buy"]]])
@@ -1340,8 +1361,8 @@ def run_exposure_v2(
     va_ds = ExposureDataset(data, history=history, horizon=horizon,
                             mode="val",   val_weeks=horizon, anchor_decay=anchor_decay)
 
-    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True)
-    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False)
+    tr_ld = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, collate_fn=exposure_collate)
+    va_ld = DataLoader(va_ds, batch_size=batch_size, shuffle=False, collate_fn=exposure_collate)
 
     print(f"Train samples: {len(tr_ds)} | Val samples: {len(va_ds)}")
 
