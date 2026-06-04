@@ -1,5 +1,13 @@
 # ============================================================
 # TCN Exposure Model V2
+# Calibration-stronger update:
+#   - gamma range reverted to [0.2, 0.8]
+#   - active_calib_weight = 0.30
+#   - mean_weight = 0.50
+#   - active pos_weight = 0.40
+#   - high_weight_alpha = 0.50
+# Purpose: reduce global overprediction before adding GL-specific structure.
+
 #
 # 改动：
 #   1. HistoryEncoder 保留全序列输出 [B, 52, D]（原来只取最后一步）
@@ -940,7 +948,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         gamma_in = torch.cat(gamma_parts, dim=-1)
 
         gamma_raw = self.gamma_head(gamma_in)
-        gamma = 0.4 + 0.6 * torch.sigmoid(gamma_raw)  # [B,H,3], initialized near 0.7
+        gamma = 0.2 + 0.6 * torch.sigmoid(gamma_raw)  # [B,H,3], initialized near 0.5
 
         mag_level = torch.expm1(log_mag).clamp(min=0.0)
         gate = torch.pow(p_active.clamp(min=1e-6, max=1.0), gamma)
@@ -1088,10 +1096,10 @@ def exposure_hurdle_loss(
     w_instock=1.00,
     bce_weight=1.00,
     mag_weight=1.00,
-    mean_weight=0.20,
-    active_calib_weight=0.10,
+    mean_weight=0.50,
+    active_calib_weight=0.30,
     horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
+    high_weight_alpha=0.50,
 ):
     true = torch.stack([
         true_total.clamp(min=0.0),
@@ -1120,7 +1128,7 @@ def exposure_hurdle_loss(
 
     # pos_weight < 1 降低对active预测的奖励，压制overbias
     # p_active单调递增说明BCE把模型推得太aggressive
-    pos_w = torch.tensor([0.6, 0.6, 0.6],
+    pos_w = torch.tensor([0.4, 0.4, 0.4],
                           dtype=log_hat.dtype,
                           device=log_hat.device).view(1, 1, 3)
     bce_raw = F.binary_cross_entropy_with_logits(
@@ -1167,9 +1175,9 @@ def train_exposure_model_v2(
     model, tr_ld, va_ld,
     epochs=60, lr=1e-3, patience=8,
     w_total=0.30, w_buy=0.60, w_instock=1.00,
-    bce_weight=1.00, mag_weight=1.00, mean_weight=0.20,
-    active_calib_weight=0.10,
-    horizon_weight_alpha=0.40, high_weight_alpha=1.00,
+    bce_weight=1.00, mag_weight=1.00, mean_weight=0.50,
+    active_calib_weight=0.30,
+    horizon_weight_alpha=0.40, high_weight_alpha=0.50,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
@@ -1744,10 +1752,10 @@ def run_exposure_v2(
     anchor_decay=0.08,
     bce_weight=0.30,
     mag_weight=1.50,
-    mean_weight=0.30,
-    active_calib_weight=0.10,
+    mean_weight=0.50,
+    active_calib_weight=0.30,
     horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
+    high_weight_alpha=0.50,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
@@ -1834,7 +1842,7 @@ def run_exposure_v2(
 #     anchor_decay=0.08,     # anchor衰减速度，越大远期越快收缩到mean13
 #     bce_weight=1.00,       # occurrence BCE loss权重
 #     mag_weight=1.00,       # magnitude Huber loss权重
-#     mean_weight=0.20,      # mean scale penalty权重
+#     mean_weight=0.50,      # mean scale penalty权重
 # )
 #
 # exposure_hat_for_demand = result["exposure_hat_for_demand"]
@@ -2070,10 +2078,10 @@ def _train_one_exposure_window(
     anchor_decay=0.08,
     bce_weight=0.30,
     mag_weight=1.50,
-    mean_weight=0.30,
-    active_calib_weight=0.10,
+    mean_weight=0.50,
+    active_calib_weight=0.30,
     horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
+    high_weight_alpha=0.50,
     dropout=0.20,
     use_encoder_self_attn=True,
 ):
@@ -2172,10 +2180,10 @@ def run_exposure_v2(
     anchor_decay=0.08,
     bce_weight=0.30,
     mag_weight=1.50,
-    mean_weight=0.30,
-    active_calib_weight=0.10,
+    mean_weight=0.50,
+    active_calib_weight=0.30,
     horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
+    high_weight_alpha=0.50,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
@@ -2264,10 +2272,10 @@ def run_exposure_v2_rolling(
     anchor_decay=0.08,
     bce_weight=0.30,
     mag_weight=1.50,
-    mean_weight=0.30,
-    active_calib_weight=0.10,
+    mean_weight=0.50,
+    active_calib_weight=0.30,
     horizon_weight_alpha=0.40,
-    high_weight_alpha=1.00,
+    high_weight_alpha=0.50,
     dropout=0.20,
     use_scot_intersection=True,
     use_encoder_self_attn=True,
