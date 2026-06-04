@@ -1,0 +1,100 @@
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+def category_code_eda(data_raw1, min_asins=30):
+    df = data_raw1.copy()
+    df["asin"] = df["asin"].astype(str)
+    
+    if "category_code" not in df.columns:
+        print("No category_code column found.")
+        return None
+    
+    df["category_code"] = df["category_code"].astype(str).fillna("MISSING")
+    df["gl_product_group"] = df["gl_product_group"].astype(str).fillna("MISSING")
+    
+    for c in ["in_stock_dph", "buy_box_dph", "total_dph", "fbi_demand"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+    
+    print("=" * 100)
+    print("CATEGORY CODE BASIC INFO")
+    print("=" * 100)
+    print("n category_code:", df["category_code"].nunique())
+    print("n GL:", df["gl_product_group"].nunique())
+    print("n ASIN:", df["asin"].nunique())
+    
+    cat_summary = (
+        df.groupby(["gl_product_group", "category_code"])
+        .agg(
+            n_rows=("asin", "size"),
+            n_asins=("asin", "nunique"),
+            instock_mean=("in_stock_dph", "mean"),
+            instock_zero_rate=("in_stock_dph", lambda x: np.mean(np.asarray(x) <= 0)),
+            buybox_zero_rate=("buy_box_dph", lambda x: np.mean(np.asarray(x) <= 0)),
+            total_zero_rate=("total_dph", lambda x: np.mean(np.asarray(x) <= 0)),
+            demand_active_rate=("fbi_demand", lambda x: np.mean(np.asarray(x) > 0)),
+        )
+        .reset_index()
+        .sort_values("n_asins", ascending=False)
+    )
+    
+    print("\n" + "=" * 100)
+    print("TOP CATEGORY CODES BY ASIN COUNT")
+    print("=" * 100)
+    display(cat_summary.head(30).round(4))
+    
+    print("\n" + "=" * 100)
+    print(f"CATEGORY CODES WITH >= {min_asins} ASINS: ZERO RATE SPREAD")
+    print("=" * 100)
+    
+    cat_big = cat_summary[cat_summary["n_asins"] >= min_asins].copy()
+    display(
+        cat_big.sort_values("instock_zero_rate", ascending=False)
+        .head(30)
+        .round(4)
+    )
+    
+    print("\nLowest zero-rate categories")
+    display(
+        cat_big.sort_values("instock_zero_rate", ascending=True)
+        .head(30)
+        .round(4)
+    )
+    
+    print("\n" + "=" * 100)
+    print("WITHIN-GL CATEGORY HETEROGENEITY")
+    print("=" * 100)
+    
+    gl_cat_spread = (
+        cat_big.groupby("gl_product_group")
+        .agg(
+            n_categories=("category_code", "nunique"),
+            total_asins=("n_asins", "sum"),
+            zero_rate_mean=("instock_zero_rate", "mean"),
+            zero_rate_min=("instock_zero_rate", "min"),
+            zero_rate_max=("instock_zero_rate", "max"),
+            zero_rate_std=("instock_zero_rate", "std"),
+            mean_dph_min=("instock_mean", "min"),
+            mean_dph_max=("instock_mean", "max"),
+        )
+        .reset_index()
+    )
+    gl_cat_spread["zero_rate_range"] = (
+        gl_cat_spread["zero_rate_max"] - gl_cat_spread["zero_rate_min"]
+    )
+    gl_cat_spread = gl_cat_spread.sort_values("zero_rate_range", ascending=False)
+    
+    display(gl_cat_spread.round(4))
+    
+    print("\n" + "=" * 100)
+    print("CATEGORY CODE USEFULNESS JUDGMENT")
+    print("=" * 100)
+    
+    print("If within-GL zero_rate_range is large, category_code is useful.")
+    print("If most category_code have very few ASINs, use embedding or graph feature, not one-hot.")
+    
+    return cat_summary, gl_cat_spread
+
+
+cat_summary, gl_cat_spread = category_code_eda(data_raw1, min_asins=30)
