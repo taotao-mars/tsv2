@@ -1,0 +1,174 @@
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+def graph_feature_eda(data_raw1, min_weeks=30):
+    df = data_raw1.copy()
+    df["asin"] = df["asin"].astype(str)
+    df["order_week"] = pd.to_datetime(df["order_week"])
+
+    for c in ["fbi_demand", "total_dph", "buy_box_dph", "in_stock_dph", "our_price"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+
+    if "customer_active_review_count" in df.columns:
+        df["customer_active_review_count"] = pd.to_numeric(
+            df["customer_active_review_count"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+    else:
+        df["customer_active_review_count"] = 0.0
+
+    if "scot_oos" in df.columns:
+        df["scot_oos"] = pd.to_numeric(df["scot_oos"], errors="coerce").fillna(0).clip(0, 1)
+    else:
+        df["scot_oos"] = 0.0
+
+    if "ind_promotion" in df.columns:
+        df["ind_promotion"] = pd.to_numeric(df["ind_promotion"], errors="coerce").fillna(0).clip(0, 1)
+    else:
+        df["ind_promotion"] = 0.0
+
+    df["month"] = df["order_week"].dt.month
+
+    def gini(x):
+        x = np.asarray(x, dtype=float)
+        x = x[x >= 0]
+        if len(x) == 0 or x.sum() <= 0:
+            return 0.0
+        x = np.sort(x)
+        n = len(x)
+        return (2 * np.arange(1, n + 1) @ x) / (n * x.sum()) - (n + 1) / n
+
+    rows = []
+
+    for asin, g in df.groupby("asin"):
+        if len(g) < min_weeks:
+            continue
+
+        y = g["in_stock_dph"].values.astype(float)
+        b = g["buy_box_dph"].values.astype(float)
+        t = g["total_dph"].values.astype(float)
+        d = g["fbi_demand"].values.astype(float)
+
+        row = {
+            "asin": asin,
+            "n_weeks": len(g),
+            "gl_product_group": str(g["gl_product_group"].iloc[0]) if "gl_product_group" in g.columns else "MISSING",
+
+            # exposure level
+            "instock_mean": y.mean(),
+            "instock_median": np.median(y),
+            "instock_std": y.std(),
+            "instock_q90": np.quantile(y, 0.90),
+            "instock_q95": np.quantile(y, 0.95),
+            "instock_max": y.max(),
+
+            # zero / active
+            "instock_zero_rate": np.mean(y <= 0),
+            "instock_active_rate": np.mean(y > 0),
+            "buybox_zero_rate": np.mean(b <= 0),
+            "total_zero_rate": np.mean(t <= 0),
+            "demand_zero_rate": np.mean(d <= 0),
+            "demand_active_rate": np.mean(d > 0),
+
+            # burstiness
+            "instock_cv": y.std() / (y.mean() + 1e-8),
+            "instock_gini": gini(y),
+            "instock_max_over_mean": y.max() / (y.mean() + 1e-8),
+            "instock_q95_over_mean": np.quantile(y, 0.95) / (y.mean() + 1e-8),
+            "top20_share": (
+                np.sort(y)[-max(1, int(0.2 * len(y))):].sum() / (y.sum() + 1e-8)
+            ),
+
+            # demand-exposure relation
+            "demand_mean": d.mean(),
+            "demand_instock_corr": np.corrcoef(d, y)[0, 1] if np.std(d) > 1e-8 and np.std(y) > 1e-8 else np.nan,
+
+            # business/static-ish
+            "price_mean": g["our_price"].mean() if "our_price" in g.columns else 0,
+            "review_last": g["customer_active_review_count"].iloc[-1],
+            "review_mean": g["customer_active_review_count"].mean(),
+            "oos_rate": g["scot_oos"].mean(),
+            "promo_rate": g["ind_promotion"].mean(),
+        }
+
+        # monthly profile: exposure share and zero rate by month
+        total_y = y.sum() + 1e-8
+        for m in range(1, 13):
+            gm = g[g["month"] == m]
+            if len(gm) == 0:
+                row[f"m{m:02d}_share"] = 0.0
+                row[f"m{m:02d}_zero"] = np.nan
+            else:
+                row[f"m{m:02d}_share"] = gm["in_stock_dph"].sum() / total_y
+                row[f"m{m:02d}_zero"] = np.mean(gm["in_stock_dph"].values <= 0)
+
+        rows.append(row)
+
+    asin_feat = pd.DataFrame(rows)
+
+    print("=" * 100)
+    print("ASIN GRAPH FEATURE TABLE")
+    print("=" * 100)
+    print("Shape:", asin_feat.shape)
+    display(asin_feat.head().round(4))
+
+    print("\n" + "=" * 100)
+    print("FEATURE SUMMARY")
+    print("=" * 100)
+    key_cols = [
+        "instock_mean", "instock_zero_rate", "instock_cv", "instock_gini",
+        "instock_max_over_mean", "top20_share", "demand_active_rate",
+        "price_mean", "review_last", "oos_rate", "promo_rate"
+    ]
+    display(asin_feat[key_cols].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]).round(4))
+
+    print("\n" + "=" * 100)
+    print("BY GL SUMMARY")
+    print("=" * 100)
+    gl_summary = (
+        asin_feat.groupby("gl_product_group")
+        .agg(
+            n_asins=("asin", "nunique"),
+            instock_mean=("instock_mean", "mean"),
+            zero_rate=("instock_zero_rate", "mean"),
+            active_rate=("instock_active_rate", "mean"),
+            cv=("instock_cv", "mean"),
+            gini=("instock_gini", "mean"),
+            top20_share=("top20_share", "mean"),
+            max_over_mean=("instock_max_over_mean", "median"),
+            demand_active_rate=("demand_active_rate", "mean"),
+            review_last=("review_last", "median"),
+            price_mean=("price_mean", "median"),
+            oos_rate=("oos_rate", "mean"),
+            promo_rate=("promo_rate", "mean"),
+        )
+        .reset_index()
+        .sort_values("n_asins", ascending=False)
+    )
+    display(gl_summary.round(4))
+
+    print("\n" + "=" * 100)
+    print("CORRELATION WITH IN_STOCK ZERO RATE")
+    print("=" * 100)
+    corr_cols = [
+        "instock_mean", "instock_q90", "instock_q95", "instock_max",
+        "instock_cv", "instock_gini", "instock_max_over_mean",
+        "top20_share", "demand_active_rate", "demand_mean",
+        "price_mean", "review_last", "review_mean", "oos_rate", "promo_rate"
+    ]
+    corr = []
+    for c in corr_cols:
+        tmp = asin_feat[[c, "instock_zero_rate"]].dropna()
+        if len(tmp) > 5 and tmp[c].std() > 1e-8:
+            corr.append({
+                "feature": c,
+                "corr_with_zero_rate": tmp[c].corr(tmp["instock_zero_rate"]),
+            })
+    corr_df = pd.DataFrame(corr).sort_values("corr_with_zero_rate")
+    display(corr_df.round(4))
+
+    return asin_feat, gl_summary, corr_df
+
+
+asin_graph_feat, gl_graph_summary, zero_corr = graph_feature_eda(data_raw1)
