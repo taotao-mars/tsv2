@@ -844,6 +844,28 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Tanh(),
         )
 
+        # ── Context-based gamma gate ──────────────────────────
+        # gamma is learned from the current horizon context, not only from h.
+        # It controls how strongly p_active gates the conditional magnitude:
+        #   pred_level = p_active ** gamma * mag_level
+        # gamma is constrained to [0.4, 1.0] and initialized at 0.7.
+        # This is more conservative than [0.2, 0.8] and helps reduce overall overprediction.
+        gamma_in = (
+            d_model
+            + max(active_feat_dim, 0)
+            + max(mag_feat_dim, 0)
+            + 3   # p_active
+            + 3   # log_mag
+        )
+        self.gamma_head = nn.Sequential(
+            nn.Linear(gamma_in, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 3),
+        )
+        nn.init.zeros_(self.gamma_head[-1].weight)
+        nn.init.zeros_(self.gamma_head[-1].bias)
+
     def forward(self, enc_out, future_context, return_aux=False):
         B, H, _ = future_context.shape
 
@@ -867,6 +889,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         z_out = self.post_norm(q + attn_out)   # [B,H,D]
 
         # ── Active Head：z_out + 事件特征 ────────────────────
+        active_feats = None
         if self.active_feat_indices and len(self.active_feat_indices) > 0:
             active_feats = future_context[:, :, self.active_feat_indices]
             active_in    = torch.cat([z_out, active_feats], dim=-1)
@@ -881,6 +904,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         # encoder只通过active_head学习"什么时候有流量"
         z_stopped = z_out.detach()
 
+        mag_feats = None
         if self.mag_feat_indices and len(self.mag_feat_indices) > 0:
             mag_feats = future_context[:, :, self.mag_feat_indices]
             mag_in    = torch.cat([z_stopped, mag_feats], dim=-1)
@@ -901,7 +925,27 @@ class TCNDecoderWithCrossAttn(nn.Module):
         else:
             log_mag = F.softplus(residual * self.residual_scale)
 
-        log_hat = p_active * log_mag
+        # ── Context-based soft gate ───────────────────────────
+        # Old formula was: log_hat = p_active * log_mag.
+        # That gates in log-space and can severely underpredict large active weeks.
+        # New formula gates in level-space with learned context-dependent gamma:
+        #   pred_level = p_active ** gamma * expm1(log_mag)
+        gamma_parts = [z_out.detach()]
+        if active_feats is not None:
+            gamma_parts.append(active_feats)
+        if mag_feats is not None:
+            gamma_parts.append(mag_feats)
+        gamma_parts.append(p_active.detach())
+        gamma_parts.append(log_mag.detach())
+        gamma_in = torch.cat(gamma_parts, dim=-1)
+
+        gamma_raw = self.gamma_head(gamma_in)
+        gamma = 0.4 + 0.6 * torch.sigmoid(gamma_raw)  # [B,H,3], initialized near 0.7
+
+        mag_level = torch.expm1(log_mag).clamp(min=0.0)
+        gate = torch.pow(p_active.clamp(min=1e-6, max=1.0), gamma)
+        pred_level = gate * mag_level
+        log_hat = torch.log1p(pred_level.clamp(min=0.0))
 
         if return_aux:
             return {
@@ -909,6 +953,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 "active_logit": active_logit,
                 "p_active":     p_active,
                 "log_mag":      log_mag,
+                "mag_level":    mag_level,
+                "gamma":        gamma,
+                "gate":         gate,
                 "residual":     residual,
                 "attn_weights": attn_w,
             }
@@ -1042,6 +1089,7 @@ def exposure_hurdle_loss(
     bce_weight=1.00,
     mag_weight=1.00,
     mean_weight=0.20,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
 ):
@@ -1094,7 +1142,21 @@ def exposure_hurdle_loss(
     mean_true  = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss  = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    return bce_weight * bce_loss + mag_weight * mag_loss + mean_weight * mean_loss
+    # ── Loss 4: Active mean calibration ─────────────────────
+    # BCE can rank occurrence well but still produce over-confident p_active.
+    # This term directly aligns the average predicted active probability with
+    # the empirical active rate, especially useful when p_active > true_active_rate.
+    p_active = torch.sigmoid(active_logit)
+    active_rate_pred = p_active.mean(dim=(0, 1))
+    active_rate_true = active_label.mean(dim=(0, 1))
+    active_calib_loss = (torch.abs(active_rate_pred - active_rate_true) * tw.view(3)).mean()
+
+    return (
+        bce_weight * bce_loss
+        + mag_weight * mag_loss
+        + mean_weight * mean_loss
+        + active_calib_weight * active_calib_loss
+    )
 
 
 # ============================================================
@@ -1106,6 +1168,7 @@ def train_exposure_model_v2(
     epochs=60, lr=1e-3, patience=8,
     w_total=0.30, w_buy=0.60, w_instock=1.00,
     bce_weight=1.00, mag_weight=1.00, mean_weight=0.20,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40, high_weight_alpha=1.00,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -1129,6 +1192,7 @@ def train_exposure_model_v2(
                 w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                 bce_weight=bce_weight, mag_weight=mag_weight,
                 mean_weight=mean_weight,
+                active_calib_weight=active_calib_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
             )
@@ -1156,6 +1220,7 @@ def train_exposure_model_v2(
                     w_total=w_total, w_buy=w_buy, w_instock=w_instock,
                     bce_weight=bce_weight, mag_weight=mag_weight,
                     mean_weight=mean_weight,
+                    active_calib_weight=active_calib_weight,
                     horizon_weight_alpha=horizon_weight_alpha,
                     high_weight_alpha=high_weight_alpha,
                 )
@@ -1194,6 +1259,8 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True):
             aux  = model(b["x"], b["future_context"], return_aux=True)
             pred = torch.expm1(aux["log_hat"]).clamp(min=0.0).cpu().numpy()
             pact = aux["p_active"].cpu().numpy()
+            gamma_np = aux.get("gamma", torch.full_like(aux["p_active"], float("nan"))).cpu().numpy()
+            gate_np = aux.get("gate", torch.full_like(aux["p_active"], float("nan"))).cpu().numpy()
 
             if apply_funnel_constraint:
                 pred[:, :, 1] = np.minimum(pred[:, :, 1], pred[:, :, 0])
@@ -1217,6 +1284,12 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True):
                         "p_active_total":    pact[i, h, 0],
                         "p_active_buy_box":  pact[i, h, 1],
                         "p_active_instock":  pact[i, h, 2],
+                        "gamma_total":       gamma_np[i, h, 0],
+                        "gamma_buy_box":     gamma_np[i, h, 1],
+                        "gamma_instock":     gamma_np[i, h, 2],
+                        "gate_total":        gate_np[i, h, 0],
+                        "gate_buy_box":      gate_np[i, h, 1],
+                        "gate_instock":      gate_np[i, h, 2],
                     })
     return pd.DataFrame(rows)
 
@@ -1378,6 +1451,25 @@ def print_exposure_diagnostics(pred_df):
                 print("  ⚠️  Still monotone — BCE may still be too strong")
             else:
                 print("  ✅  Not monotone — BCE is calibrated correctly")
+
+    # ── gamma / gate诊断 ─────────────────────────────────────
+    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock"] if c in pred_df.columns]
+    if gamma_gate_cols:
+        print("\n" + "=" * 100)
+        print("GAMMA / GATE BY HORIZON: IN_STOCK")
+        print("=" * 100)
+        gg_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            if "gamma_instock" in g.columns:
+                row["gamma_instock_mean"] = g["gamma_instock"].mean()
+            if "gate_instock" in g.columns:
+                row["gate_instock_mean"] = g["gate_instock"].mean()
+            if "p_active_instock" in g.columns:
+                row["p_active_instock_mean"] = g["p_active_instock"].mean()
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            gg_rows.append(row)
+        print(pd.DataFrame(gg_rows).round(4).to_string(index=False))
 
     # ── ASIN级别诊断 ─────────────────────────────────────────
     print("\n" + "=" * 100)
@@ -1653,6 +1745,7 @@ def run_exposure_v2(
     bce_weight=0.30,
     mag_weight=1.50,
     mean_weight=0.30,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
@@ -1697,6 +1790,7 @@ def run_exposure_v2(
         model=model, tr_ld=tr_ld, va_ld=va_ld,
         epochs=epochs, lr=lr, patience=patience,
         bce_weight=bce_weight, mag_weight=mag_weight, mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
         horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
     )
 
@@ -1977,6 +2071,7 @@ def _train_one_exposure_window(
     bce_weight=0.30,
     mag_weight=1.50,
     mean_weight=0.30,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
     dropout=0.20,
@@ -2034,6 +2129,7 @@ def _train_one_exposure_window(
         bce_weight=bce_weight,
         mag_weight=mag_weight,
         mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
     )
@@ -2077,6 +2173,7 @@ def run_exposure_v2(
     bce_weight=0.30,
     mag_weight=1.50,
     mean_weight=0.30,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
     dropout=0.20,
@@ -2116,6 +2213,7 @@ def run_exposure_v2(
         bce_weight=bce_weight,
         mag_weight=mag_weight,
         mean_weight=mean_weight,
+        active_calib_weight=active_calib_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         dropout=dropout,
@@ -2123,12 +2221,24 @@ def run_exposure_v2(
     )
 
     pred_df = out["forecast_df"]
+
+    # GL-level diagnostics are useful because GL groups have different seasonal/burst patterns.
+    gl_diag = diagnose_by_gl_group(pred_df, df, target="instock", min_asins=30, top_n=30)
+    gl_block_diag = diagnose_by_gl_horizon_block(pred_df, df, target="instock", min_asins=30)
+    gl_summary = summarize_gl_diagnostics(gl_diag, min_asins=30)
+    out["diagnostics"]["gl_group"] = gl_diag
+    out["diagnostics"]["gl_horizon_block"] = gl_block_diag
+    out["diagnostics"]["gl_summary"] = gl_summary
+
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
         "source_df": df,
+        "gl_diagnostics": gl_diag,
+        "gl_horizon_block_diagnostics": gl_block_diag,
+        "gl_summary": gl_summary,
     })
     return out
 
@@ -2155,6 +2265,7 @@ def run_exposure_v2_rolling(
     bce_weight=0.30,
     mag_weight=1.50,
     mean_weight=0.30,
+    active_calib_weight=0.10,
     horizon_weight_alpha=0.40,
     high_weight_alpha=1.00,
     dropout=0.20,
@@ -2199,6 +2310,7 @@ def run_exposure_v2_rolling(
                 bce_weight=bce_weight,
                 mag_weight=mag_weight,
                 mean_weight=mean_weight,
+                active_calib_weight=active_calib_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
                 dropout=dropout,
@@ -2218,6 +2330,20 @@ def run_exposure_v2_rolling(
     latest_offset = 0 if 0 in results_by_offset else sorted(results_by_offset.keys())[-1]
     latest_pred_df = results_by_offset[latest_offset]["forecast_df"]
 
+    # GL diagnostics for the latest prediction window and for all rolling windows.
+    latest_gl_diag = diagnose_by_gl_group(latest_pred_df, df, target="instock", min_asins=30, top_n=30)
+    latest_gl_block_diag = diagnose_by_gl_horizon_block(latest_pred_df, df, target="instock", min_asins=30)
+    latest_gl_summary = summarize_gl_diagnostics(latest_gl_diag, min_asins=30)
+
+    rolling_gl_diag = diagnose_by_gl_group(rolling_pred_df, df, target="instock", min_asins=30, top_n=30)
+    rolling_gl_summary = summarize_gl_diagnostics(rolling_gl_diag, min_asins=30)
+
+    rolling_diagnostics["latest_gl_group"] = latest_gl_diag
+    rolling_diagnostics["latest_gl_horizon_block"] = latest_gl_block_diag
+    rolling_diagnostics["latest_gl_summary"] = latest_gl_summary
+    rolling_diagnostics["rolling_gl_group"] = rolling_gl_diag
+    rolling_diagnostics["rolling_gl_summary"] = rolling_gl_summary
+
     return {
         "results_by_offset": results_by_offset,
         "rolling_forecast_df": rolling_pred_df,
@@ -2229,10 +2355,229 @@ def run_exposure_v2_rolling(
         "data": data,
         "source_df": df,
         "rolling_offsets": list(rolling_offsets),
+        "gl_diagnostics": latest_gl_diag,
+        "gl_horizon_block_diagnostics": latest_gl_block_diag,
+        "gl_summary": latest_gl_summary,
+        "rolling_gl_diagnostics": rolling_gl_diag,
+        "rolling_gl_summary": rolling_gl_summary,
     }
 
 
 
+
+
+# ============================================================
+# GL diagnostics: check whether different GL groups are calibrated differently
+# ============================================================
+
+def _attach_gl_product_group(pred_df, source_df):
+    """
+    Attach one GL product group per ASIN to a prediction dataframe.
+    This uses source_df after sampling/filtering when available.
+    """
+    tmp = pred_df.copy()
+    tmp["asin"] = tmp["asin"].astype(str)
+
+    if source_df is None or "gl_product_group" not in source_df.columns:
+        tmp["gl_product_group"] = "MISSING"
+        return tmp
+
+    gl_map = (
+        source_df[["asin", "gl_product_group"]]
+        .dropna(subset=["asin"])
+        .drop_duplicates("asin")
+        .copy()
+    )
+    gl_map["asin"] = gl_map["asin"].astype(str)
+    gl_map["gl_product_group"] = gl_map["gl_product_group"].astype(str).fillna("MISSING")
+
+    tmp = tmp.merge(gl_map, on="asin", how="left")
+    tmp["gl_product_group"] = tmp["gl_product_group"].astype(str).fillna("MISSING")
+    return tmp
+
+
+def diagnose_by_gl_group(pred_df, source_df, target="instock", min_asins=30, top_n=30):
+    """
+    Per-GL diagnostics for exposure forecast.
+
+    target can be:
+      - "instock" / "in_stock"
+      - "buy_box"
+      - "total"
+
+    Returns a dataframe with one row per GL group.
+    """
+    target = str(target).lower()
+    col_map = {
+        "instock": ("true_instock_dph", "pred_instock_dph", "p_active_instock"),
+        "in_stock": ("true_instock_dph", "pred_instock_dph", "p_active_instock"),
+        "buy_box": ("true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box"),
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph", "p_active_buy_box"),
+        "total": ("true_total_dph", "pred_total_dph", "p_active_total"),
+    }
+    if target not in col_map:
+        raise ValueError(f"Unknown target={target}. Use instock, buy_box, or total.")
+
+    true_col, pred_col, p_col = col_map[target]
+    tmp = _attach_gl_product_group(pred_df, source_df)
+
+    rows = []
+    for gl, g in tmp.groupby("gl_product_group", dropna=False):
+        y = g[true_col].values.astype(float)
+        p = g[pred_col].values.astype(float)
+        active = (y > 0).astype(int)
+        rows.append({
+            "gl_product_group": gl,
+            "n_rows": int(len(g)),
+            "n_asins": int(g["asin"].nunique()),
+            "true_mean": float(np.mean(y)),
+            "pred_mean": float(np.mean(p)),
+            "ratio": float(np.mean(p) / (np.mean(y) + 1e-8)),
+            "WAPE": float(_wape(y, p)),
+            "underbias": float(np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "overbias": float(np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "corr": float(_corr(y, p)) if not np.isnan(_corr(y, p)) else np.nan,
+            "active_AUC": float(_auc(active, p)) if not np.isnan(_auc(active, p)) else np.nan,
+            "true_active_rate": float(np.mean(y > 0)),
+            "p_active_mean": float(g[p_col].mean()) if p_col in g.columns else np.nan,
+            "p_active_minus_true": float(g[p_col].mean() - np.mean(y > 0)) if p_col in g.columns else np.nan,
+        })
+
+    out = pd.DataFrame(rows).sort_values("n_asins", ascending=False).reset_index(drop=True)
+    eligible = out[out["n_asins"] >= min_asins].copy()
+
+    print("\n" + "=" * 100)
+    print(f"PER-GL DIAGNOSTICS: {target.upper()} DPH")
+    print("=" * 100)
+    if len(out) == 0:
+        print("No GL diagnostics available.")
+        return out
+
+    print("Top GL groups by ASIN count:")
+    display(out.head(top_n).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH LARGEST OVERPREDICTION (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("ratio", ascending=False).head(15).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH LARGEST UNDERPREDICTION (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("ratio", ascending=True).head(15).round(4))
+
+    print("\n" + "=" * 100)
+    print(f"GL GROUPS WITH WORST WAPE (n_asins >= {min_asins})")
+    print("=" * 100)
+    display(eligible.sort_values("WAPE", ascending=False).head(15).round(4))
+
+    return out
+
+
+def diagnose_by_gl_horizon_block(pred_df, source_df, target="instock", min_asins=30):
+    """
+    Per-GL x horizon block diagnostics.
+    This tells whether each GL is over/under mainly in short, middle, or long horizons.
+    """
+    target = str(target).lower()
+    col_map = {
+        "instock": ("true_instock_dph", "pred_instock_dph"),
+        "in_stock": ("true_instock_dph", "pred_instock_dph"),
+        "buy_box": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "total": ("true_total_dph", "pred_total_dph"),
+    }
+    if target not in col_map:
+        raise ValueError(f"Unknown target={target}. Use instock, buy_box, or total.")
+
+    true_col, pred_col = col_map[target]
+    tmp = _attach_gl_product_group(pred_df, source_df)
+    tmp["block"] = pd.cut(
+        tmp["horizon"],
+        bins=[0, 5, 12, 20],
+        labels=["short_1_5", "mid_6_12", "long_13_20"],
+    )
+
+    rows = []
+    for (gl, block), g in tmp.groupby(["gl_product_group", "block"], observed=True):
+        n_asins = int(g["asin"].nunique())
+        if n_asins < min_asins:
+            continue
+        y = g[true_col].values.astype(float)
+        p = g[pred_col].values.astype(float)
+        rows.append({
+            "gl_product_group": gl,
+            "block": str(block),
+            "n_asins": n_asins,
+            "n_rows": int(len(g)),
+            "true_mean": float(np.mean(y)),
+            "pred_mean": float(np.mean(p)),
+            "ratio": float(np.mean(p) / (np.mean(y) + 1e-8)),
+            "WAPE": float(_wape(y, p)),
+            "underbias": float(np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "overbias": float(np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8)),
+            "corr": float(_corr(y, p)) if not np.isnan(_corr(y, p)) else np.nan,
+            "active_AUC": float(_auc((y > 0).astype(int), p)) if not np.isnan(_auc((y > 0).astype(int), p)) else np.nan,
+        })
+
+    out = pd.DataFrame(rows)
+    print("\n" + "=" * 100)
+    print(f"PER-GL × HORIZON BLOCK DIAGNOSTICS: {target.upper()} DPH")
+    print("=" * 100)
+    if len(out) == 0:
+        print("No GL x block diagnostics available. Try lowering min_asins.")
+        return out
+
+    display(out.sort_values(["gl_product_group", "block"]).round(4))
+
+    print("\n" + "=" * 100)
+    print("WORST GL × BLOCK OVERPREDICTION")
+    print("=" * 100)
+    display(out.sort_values("ratio", ascending=False).head(20).round(4))
+
+    print("\n" + "=" * 100)
+    print("WORST GL × BLOCK UNDERPREDICTION")
+    print("=" * 100)
+    display(out.sort_values("ratio", ascending=True).head(20).round(4))
+
+    return out
+
+
+def summarize_gl_diagnostics(gl_diag, min_asins=30):
+    """
+    Compact summary to decide whether the next fix should be global calibration or GL-specific calibration.
+    """
+    if gl_diag is None or len(gl_diag) == 0:
+        return {}
+    g = gl_diag[gl_diag["n_asins"] >= min_asins].copy()
+    if len(g) == 0:
+        return {}
+
+    summary = {
+        "n_gl_groups": int(len(g)),
+        "share_over_1p10": float((g["ratio"] > 1.10).mean()),
+        "share_under_0p90": float((g["ratio"] < 0.90).mean()),
+        "median_ratio": float(g["ratio"].median()),
+        "weighted_ratio_by_rows": float(np.average(g["ratio"], weights=g["n_rows"])),
+        "median_WAPE": float(g["WAPE"].median()),
+        "median_active_AUC": float(g["active_AUC"].median()),
+        "median_p_active_minus_true": float(g["p_active_minus_true"].median()) if "p_active_minus_true" in g.columns else np.nan,
+    }
+
+    print("\n" + "=" * 100)
+    print("GL DIAGNOSTIC SUMMARY")
+    print("=" * 100)
+    for k, v in summary.items():
+        print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+    if summary["share_over_1p10"] > 0.50:
+        print("\nJudgment: most GL groups are overpredicted → global calibration/gamma should be fixed first.")
+    elif summary["share_under_0p90"] > 0.50:
+        print("\nJudgment: most GL groups are underpredicted → global level/gamma may be too conservative.")
+    else:
+        print("\nJudgment: bias is GL-specific → consider GL-specific calibration or GL embedding next.")
+
+    return summary
 
 def run_exposure_v2_final_scot_5000(
     data_raw1,
@@ -2290,6 +2635,9 @@ def run_exposure_v2_final_scot_5000(
 # pred_df = result["forecast_df"]
 # exposure_hat_for_demand = result["exposure_hat_for_demand"]
 # diagnostics = result["diagnostics"]
+# gl_diag = result["gl_diagnostics"]
+# gl_block_diag = result["gl_horizon_block_diagnostics"]
+# gl_summary = result["gl_summary"]
 #
 # Optional no-attention ablation:
 # result_no_attn = run_exposure_v2_final_scot_5000(
