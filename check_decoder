@@ -1,0 +1,20 @@
+import inspect
+
+print("===== TCN_ENN init =====")
+src_init = inspect.getsource(TCN_ENN.__init__)
+print(src_init)
+
+print("\n===== TCN_ENN augment =====")
+src_aug = inspect.getsource(TCN_ENN._augment_context_with_stock_hat)
+print(src_aug)
+
+print("\n===== 判定结果 =====")
+if "TrueLagExposureDecoder" in src_init or "self.stock_decoder(" in src_aug:
+    print("❌ 当前模型会走 internal TrueLagExposureDecoder")
+else:
+    print("✅ 当前模型没有走 internal decoder")
+
+if "stock_decoder = None" in src_init and "_extract_attention_exposure_log" in src_aug:
+    print("✅ 当前是 external predicted exposure append 版本")
+else:
+    print("⚠️ 当前不是我预期的 external exposure append 版本，请检查")
