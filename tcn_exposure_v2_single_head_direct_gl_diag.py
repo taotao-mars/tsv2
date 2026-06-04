@@ -1059,6 +1059,8 @@ def exposure_hurdle_loss(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
 ):
@@ -1095,6 +1097,22 @@ def exposure_hurdle_loss(
     log_err = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
     direct_loss = (log_err * sample_w * tw).mean()
 
+    # Zero-aware loss.
+    # Direct log regression tends to regress true-zero weeks to small/medium positive values.
+    # This extra term teaches the single-head output itself to stay close to log(1+0)=0
+    # when the observed exposure is zero. It does not use zero predictions as inputs.
+    zero_mask = (true <= 0).float()
+    zero_err = F.huber_loss(log_hat, torch.zeros_like(log_hat), delta=0.5, reduction="none")
+    zero_denom = (zero_mask * sample_w * tw).sum().clamp_min(1.0)
+    zero_loss = (zero_err * zero_mask * sample_w * tw).sum() / zero_denom
+
+    # Hierarchical zero consistency.
+    # Business rule: if true total_dph is zero, buy_box and in_stock are almost always zero.
+    # During training, strongly penalize any predicted total/buybox/instock exposure on those rows.
+    total_zero_mask = (true_total <= 0).float().unsqueeze(-1)
+    total_zero_denom = (total_zero_mask * sample_w * tw).sum().clamp_min(1.0)
+    total_zero_loss = (zero_err * total_zero_mask * sample_w * tw).sum() / total_zero_denom
+
     # Mean scale penalty on level space, used lightly to avoid systematic over/under.
     pred_level = torch.expm1(log_hat).clamp(min=0.0)
     mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)).clamp_min(1e-6))
@@ -1122,6 +1140,8 @@ def exposure_hurdle_loss(
         + mean_weight * mean_loss
         + bce_weight * bce_loss
         + active_calib_weight * active_calib_loss
+        + zero_weight * zero_loss
+        + total_zero_consistency_weight * total_zero_loss
     )
 
 
@@ -1135,6 +1155,8 @@ def train_exposure_model_v2(
     w_total=0.30, w_buy=0.60, w_instock=1.00,
     bce_weight=0.20, mag_weight=1.00, mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25, high_weight_alpha=0.30,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -1159,6 +1181,8 @@ def train_exposure_model_v2(
                 bce_weight=bce_weight, mag_weight=mag_weight,
                 mean_weight=mean_weight,
                 active_calib_weight=active_calib_weight,
+                zero_weight=zero_weight,
+                total_zero_consistency_weight=total_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
             )
@@ -1765,6 +1789,8 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
@@ -2091,6 +2117,8 @@ def _train_one_exposure_window(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2149,6 +2177,8 @@ def _train_one_exposure_window(
         mag_weight=mag_weight,
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
     )
@@ -2193,6 +2223,8 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2233,6 +2265,8 @@ def run_exposure_v2(
         mag_weight=mag_weight,
         mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
         dropout=dropout,
@@ -2285,6 +2319,8 @@ def run_exposure_v2_rolling(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
+    zero_weight=0.15,
+    total_zero_consistency_weight=0.25,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2330,6 +2366,8 @@ def run_exposure_v2_rolling(
                 mag_weight=mag_weight,
                 mean_weight=mean_weight,
                 active_calib_weight=active_calib_weight,
+                zero_weight=zero_weight,
+                total_zero_consistency_weight=total_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
                 dropout=dropout,
