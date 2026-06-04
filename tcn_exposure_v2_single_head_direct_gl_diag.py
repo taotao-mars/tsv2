@@ -1059,21 +1059,33 @@ def exposure_hurdle_loss(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    # Zero-aware weights. Zero mainly happens in buy_box / in_stock, not total.
+    zero_weight=0.00,  # kept for backward compatibility; not used as the main zero term
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
 ):
     """
-    Single-head direct exposure loss.
+    Single-head direct exposure loss with channel-specific zero awareness.
 
-    Main objective:
-        Huber(log1p(pred), log1p(true))
-        + mean scale penalty
-        + small auxiliary active BCE/calibration.
+    Why this version:
+      - total_dph is almost never zero in the data, so total-zero consistency alone
+        does not teach the model to capture in_stock zeros.
+      - buy_box_dph / in_stock_dph have meaningful zero rates that vary by GL/month.
+      - The final prediction is still single-head direct; p_active is auxiliary only.
 
-    The active head does NOT gate the final prediction. It only helps the
-    representation learn occurrence and provides p_active diagnostics.
+    Main terms:
+      1. direct log1p Huber regression
+      2. light mean scale penalty
+      3. auxiliary active BCE/calibration
+      4. channel-specific zero losses for buy_box and in_stock
+      5. hierarchy zero consistency:
+           true_total == 0   => total/buy_box/in_stock should be near 0
+           true_buy_box == 0 => buy_box/in_stock should be near 0
     """
     true = torch.stack([
         true_total.clamp(min=0.0),
@@ -1093,33 +1105,56 @@ def exposure_hurdle_loss(
     horizon_w = 1.0 + horizon_weight_alpha * (h / max(float(H), 1.0))
     sample_w = high_w * horizon_w
 
-    # Main direct log loss.
+    # 1) Main direct log loss.
     log_err = F.huber_loss(log_hat, target_log, delta=1.0, reduction="none")
     direct_loss = (log_err * sample_w * tw).mean()
 
-    # Zero-aware loss.
-    # Direct log regression tends to regress true-zero weeks to small/medium positive values.
-    # This extra term teaches the single-head output itself to stay close to log(1+0)=0
-    # when the observed exposure is zero. It does not use zero predictions as inputs.
-    zero_mask = (true <= 0).float()
+    # Shared zero error: target log is zero when target exposure is zero.
     zero_err = F.huber_loss(log_hat, torch.zeros_like(log_hat), delta=0.5, reduction="none")
-    zero_denom = (zero_mask * sample_w * tw).sum().clamp_min(1.0)
-    zero_loss = (zero_err * zero_mask * sample_w * tw).sum() / zero_denom
 
-    # Hierarchical zero consistency.
-    # Business rule: if true total_dph is zero, buy_box and in_stock are almost always zero.
-    # During training, strongly penalize any predicted total/buybox/instock exposure on those rows.
+    def _masked_channel_loss(mask_2d, channel_idx, channel_weight=1.0):
+        """Mask shape [B,H]. Penalize one output channel when the matching true channel is zero."""
+        m = mask_2d.float().unsqueeze(-1)  # [B,H,1]
+        ch = torch.zeros_like(true)
+        ch[..., channel_idx] = 1.0
+        weight = m * ch * sample_w * tw
+        denom = weight.sum().clamp_min(1.0)
+        return channel_weight * (zero_err * weight).sum() / denom
+
+    # 2) Channel-specific zero losses.
+    # total is rare-zero, keep small; buy_box/in_stock are the important channels.
+    total_zero_loss = _masked_channel_loss(true_total <= 0, 0)
+    buy_zero_loss = _masked_channel_loss(true_buy <= 0, 1)
+    instock_zero_loss = _masked_channel_loss(true_instock <= 0, 2)
+
+    # 3) Hierarchy zero consistency.
+    # If total is zero, all channels should be near zero. This is correct but rare.
     total_zero_mask = (true_total <= 0).float().unsqueeze(-1)
-    total_zero_denom = (total_zero_mask * sample_w * tw).sum().clamp_min(1.0)
-    total_zero_loss = (zero_err * total_zero_mask * sample_w * tw).sum() / total_zero_denom
+    total_zero_weight_mat = total_zero_mask * sample_w * tw
+    total_zero_consistency = (zero_err * total_zero_weight_mat).sum() / total_zero_weight_mat.sum().clamp_min(1.0)
 
-    # Mean scale penalty on level space, used lightly to avoid systematic over/under.
+    # If buy_box is zero, buy_box and in_stock should be near zero.
+    # This matters more than total-zero consistency in this dataset.
+    buy_zero_mask = (true_buy <= 0).float().unsqueeze(-1)
+    buy_instock_selector = torch.tensor([0.0, 1.0, 1.0], dtype=log_hat.dtype, device=log_hat.device).view(1, 1, 3)
+    buy_zero_weight_mat = buy_zero_mask * buy_instock_selector * sample_w * tw
+    buy_zero_consistency = (zero_err * buy_zero_weight_mat).sum() / buy_zero_weight_mat.sum().clamp_min(1.0)
+
+    zero_loss = (
+        total_zero_weight * total_zero_loss
+        + buy_zero_weight * buy_zero_loss
+        + instock_zero_weight * instock_zero_loss
+        + total_zero_consistency_weight * total_zero_consistency
+        + buy_zero_consistency_weight * buy_zero_consistency
+    )
+
+    # 4) Mean scale penalty on level space, used lightly to avoid systematic over/under.
     pred_level = torch.expm1(log_hat).clamp(min=0.0)
     mean_pred = torch.log1p(pred_level.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_true = torch.log1p(true.mean(dim=(0, 1)).clamp_min(1e-6))
     mean_loss = (torch.abs(mean_pred - mean_true) * tw.view(3)).mean()
 
-    # Auxiliary occurrence loss. This is deliberately small.
+    # 5) Auxiliary occurrence loss. This is deliberately small and does not gate final predictions.
     active_label = (true > 0).float()
     pos_w = torch.tensor([0.5, 0.5, 0.5],
                          dtype=log_hat.dtype,
@@ -1140,10 +1175,8 @@ def exposure_hurdle_loss(
         + mean_weight * mean_loss
         + bce_weight * bce_loss
         + active_calib_weight * active_calib_loss
-        + zero_weight * zero_loss
-        + total_zero_consistency_weight * total_zero_loss
+        + zero_loss
     )
-
 
 # ============================================================
 # 训练
@@ -1155,8 +1188,12 @@ def train_exposure_model_v2(
     w_total=0.30, w_buy=0.60, w_instock=1.00,
     bce_weight=0.20, mag_weight=1.00, mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25, high_weight_alpha=0.30,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -1182,7 +1219,11 @@ def train_exposure_model_v2(
                 mean_weight=mean_weight,
                 active_calib_weight=active_calib_weight,
                 zero_weight=zero_weight,
+                total_zero_weight=total_zero_weight,
+                buy_zero_weight=buy_zero_weight,
+                instock_zero_weight=instock_zero_weight,
                 total_zero_consistency_weight=total_zero_consistency_weight,
+                buy_zero_consistency_weight=buy_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
             )
@@ -1211,6 +1252,12 @@ def train_exposure_model_v2(
                     bce_weight=bce_weight, mag_weight=mag_weight,
                     mean_weight=mean_weight,
                     active_calib_weight=active_calib_weight,
+                    zero_weight=zero_weight,
+                    total_zero_weight=total_zero_weight,
+                    buy_zero_weight=buy_zero_weight,
+                    instock_zero_weight=instock_zero_weight,
+                    total_zero_consistency_weight=total_zero_consistency_weight,
+                    buy_zero_consistency_weight=buy_zero_consistency_weight,
                     horizon_weight_alpha=horizon_weight_alpha,
                     high_weight_alpha=high_weight_alpha,
                 )
@@ -1789,8 +1836,12 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
@@ -1836,6 +1887,12 @@ def run_exposure_v2(
         epochs=epochs, lr=lr, patience=patience,
         bce_weight=bce_weight, mag_weight=mag_weight, mean_weight=mean_weight,
         active_calib_weight=active_calib_weight,
+        zero_weight=zero_weight,
+        total_zero_weight=total_zero_weight,
+        buy_zero_weight=buy_zero_weight,
+        instock_zero_weight=instock_zero_weight,
+        total_zero_consistency_weight=total_zero_consistency_weight,
+        buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
     )
 
@@ -2117,8 +2174,12 @@ def _train_one_exposure_window(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2223,8 +2284,12 @@ def run_exposure_v2(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2319,8 +2384,12 @@ def run_exposure_v2_rolling(
     mag_weight=1.00,
     mean_weight=0.25,
     active_calib_weight=0.05,
-    zero_weight=0.15,
-    total_zero_consistency_weight=0.25,
+    zero_weight=0.00,
+    total_zero_weight=0.02,
+    buy_zero_weight=0.10,
+    instock_zero_weight=0.20,
+    total_zero_consistency_weight=0.03,
+    buy_zero_consistency_weight=0.15,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.30,
     dropout=0.20,
@@ -2367,7 +2436,11 @@ def run_exposure_v2_rolling(
                 mean_weight=mean_weight,
                 active_calib_weight=active_calib_weight,
                 zero_weight=zero_weight,
+                total_zero_weight=total_zero_weight,
+                buy_zero_weight=buy_zero_weight,
+                instock_zero_weight=instock_zero_weight,
                 total_zero_consistency_weight=total_zero_consistency_weight,
+                buy_zero_consistency_weight=buy_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
                 dropout=dropout,
