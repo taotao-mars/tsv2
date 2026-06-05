@@ -7,6 +7,11 @@
 #   - keep GL diagnostics and final summary table
 #   - add category_code code/frequency/unknown static features without changing run input API
 # Purpose: stabilize point exposure forecasts and add finer category structure before graph.
+# Long-run balanced preset:
+#   - category_code is kept
+#   - channel-specific zero loss is softened to avoid systematic underprediction
+#   - mean-level penalty is slightly stronger to keep overall ratio near 1
+#   - high-exposure weighting is slightly stronger to protect Q5/peak ASINs
 
 #
 # 改动：
@@ -1102,13 +1107,13 @@ def exposure_hurdle_loss(
     active_calib_weight=0.05,
     # Zero-aware weights. Zero mainly happens in buy_box / in_stock, not total.
     zero_weight=0.00,  # kept for backward compatibility; not used as the main zero term
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
-    high_weight_alpha=0.30,
+    high_weight_alpha=0.35,
 ):
     """
     Single-head direct exposure loss with channel-specific zero awareness.
@@ -1227,15 +1232,15 @@ def train_exposure_model_v2(
     model, tr_ld, va_ld,
     epochs=60, lr=1e-3, patience=8,
     w_total=0.30, w_buy=0.60, w_instock=1.00,
-    bce_weight=0.20, mag_weight=1.00, mean_weight=0.25,
+    bce_weight=0.15, mag_weight=1.00, mean_weight=0.35,
     active_calib_weight=0.05,
     zero_weight=0.00,
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
-    horizon_weight_alpha=0.25, high_weight_alpha=0.30,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
+    horizon_weight_alpha=0.25, high_weight_alpha=0.35,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
@@ -1878,18 +1883,19 @@ def run_exposure_v2(
     mean_weight=0.25,
     active_calib_weight=0.05,
     zero_weight=0.00,
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
-    high_weight_alpha=0.30,
+    high_weight_alpha=0.35,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: TCN Full-Seq Encoder + Cross-Attn + SINGLE-HEAD DIRECT")
+    print("Preset: category_code + softened zero-aware loss + stronger mean-level balance")
     print("=" * 100)
 
     df = prepare_data_from_sample(data_raw1, scot_df, n_asins, seed)
@@ -2216,13 +2222,13 @@ def _train_one_exposure_window(
     mean_weight=0.25,
     active_calib_weight=0.05,
     zero_weight=0.00,
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
-    high_weight_alpha=0.30,
+    high_weight_alpha=0.35,
     dropout=0.20,
     use_encoder_self_attn=True,
 ):
@@ -2326,13 +2332,13 @@ def run_exposure_v2(
     mean_weight=0.25,
     active_calib_weight=0.05,
     zero_weight=0.00,
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
-    high_weight_alpha=0.30,
+    high_weight_alpha=0.35,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
@@ -2426,13 +2432,13 @@ def run_exposure_v2_rolling(
     mean_weight=0.25,
     active_calib_weight=0.05,
     zero_weight=0.00,
-    total_zero_weight=0.02,
-    buy_zero_weight=0.10,
-    instock_zero_weight=0.20,
-    total_zero_consistency_weight=0.03,
-    buy_zero_consistency_weight=0.15,
+    total_zero_weight=0.01,
+    buy_zero_weight=0.05,
+    instock_zero_weight=0.08,
+    total_zero_consistency_weight=0.01,
+    buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
-    high_weight_alpha=0.30,
+    high_weight_alpha=0.35,
     dropout=0.20,
     use_scot_intersection=True,
     use_encoder_self_attn=True,
@@ -2756,8 +2762,8 @@ def run_exposure_v2_final_scot_5000(
     seed=42,
     history=13,
     horizon=20,
-    epochs=30,
-    patience=6,
+    epochs=60,
+    patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
 ):
