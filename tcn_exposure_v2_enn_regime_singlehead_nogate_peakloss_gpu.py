@@ -871,13 +871,29 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  active_feat_indices=None,
                  mag_feat_indices=None,
                  active_feat_dim=0,
-                 mag_feat_dim=0):
+                 mag_feat_dim=0,
+                 use_enn=True,
+                 z_dim=8,
+                 residual_scale=2.0,
+                 gate_temperature=1.0):
         super().__init__()
         self.horizon = horizon
         self.anchor_indices = anchor_indices
         self.active_feat_indices = active_feat_indices
         self.mag_feat_indices = mag_feat_indices
-        self.residual_scale = 2.0
+        self.use_enn = bool(use_enn)
+        self.z_dim = int(z_dim)
+        self.residual_scale = float(residual_scale)
+        self.gate_temperature = float(gate_temperature)
+
+        if self.use_enn:
+            self.z_proj = nn.Sequential(
+                nn.Linear(self.z_dim, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.z_proj = None
 
         # future_context + horizon position encoding -> hidden
         self.input_proj = nn.Sequential(
