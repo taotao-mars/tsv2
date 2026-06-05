@@ -1,0 +1,157 @@
+import numpy as np
+import pandas as pd
+from IPython.display import display
+
+def sample_asin_trajectories_by_group(
+    pred_df,
+    data_raw1,
+    group_col="gl_product_group",
+    target="instock",
+    n_per_group=5,
+    min_asins_per_group=5,
+    seed=42,
+):
+    """
+    Randomly sample n ASINs per group and print 20-horizon true/pred trajectories.
+    """
+
+    col_map = {
+        "instock": ("true_instock_dph", "pred_instock_dph"),
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "total": ("true_total_dph", "pred_total_dph"),
+    }
+
+    true_col, pred_col = col_map[target]
+
+    df = pred_df.copy()
+    df["asin"] = df["asin"].astype(str)
+
+    meta = (
+        data_raw1[["asin", group_col]]
+        .drop_duplicates("asin")
+        .copy()
+    )
+    meta["asin"] = meta["asin"].astype(str)
+    meta[group_col] = meta[group_col].astype(str).fillna("MISSING")
+
+    df = df.merge(meta, on="asin", how="left")
+    df[group_col] = df[group_col].fillna("MISSING").astype(str)
+
+    rng = np.random.default_rng(seed)
+
+    group_asin_counts = (
+        df.groupby(group_col)["asin"]
+        .nunique()
+        .reset_index(name="n_asins")
+        .sort_values("n_asins", ascending=False)
+    )
+
+    print("=" * 100)
+    print(f"RANDOM ASIN TRAJECTORIES BY {group_col} | target={target}")
+    print("=" * 100)
+    display(group_asin_counts)
+
+    sampled_rows = []
+
+    for group_value, g in df.groupby(group_col):
+        asins = sorted(g["asin"].unique())
+        if len(asins) < min_asins_per_group:
+            continue
+
+        sampled_asins = rng.choice(
+            asins,
+            size=min(n_per_group, len(asins)),
+            replace=False,
+        )
+
+        for asin in sampled_asins:
+            one = (
+                g[g["asin"] == asin]
+                .sort_values("horizon")
+                [["asin", group_col, "order_week", "horizon", true_col, pred_col]]
+                .copy()
+            )
+
+            one["err"] = one[pred_col] - one[true_col]
+            one["abs_err"] = one["err"].abs()
+            one["ratio"] = one[pred_col] / (one[true_col] + 1e-8)
+
+            true_sum = one[true_col].sum()
+            pred_sum = one[pred_col].sum()
+
+            one["true_20w_sum"] = true_sum
+            one["pred_20w_sum"] = pred_sum
+            one["sum_ratio"] = pred_sum / (true_sum + 1e-8)
+
+            sampled_rows.append(one)
+
+    out = pd.concat(sampled_rows, ignore_index=True)
+
+    # 打印每个 group 的 sampled ASIN summary
+    summary = (
+        out.groupby([group_col, "asin"])
+        .agg(
+            true_20w_sum=(true_col, "sum"),
+            pred_20w_sum=(pred_col, "sum"),
+            mean_true=(true_col, "mean"),
+            mean_pred=(pred_col, "mean"),
+            WAPE=("abs_err", lambda x: x.sum()),
+        )
+        .reset_index()
+    )
+
+    # 修正 WAPE denominator
+    denom = (
+        out.groupby([group_col, "asin"])[true_col]
+        .apply(lambda x: np.abs(x).sum() + 1e-8)
+        .reset_index(name="denom")
+    )
+    summary = summary.merge(denom, on=[group_col, "asin"], how="left")
+    summary["WAPE"] = summary["WAPE"] / summary["denom"]
+    summary["sum_ratio"] = summary["pred_20w_sum"] / (summary["true_20w_sum"] + 1e-8)
+
+    print("\n" + "=" * 100)
+    print("SAMPLED ASIN 20-WEEK SUMMARY")
+    print("=" * 100)
+    display(summary.round(4))
+
+    print("\n" + "=" * 100)
+    print("FULL 20-HORIZON TRAJECTORIES")
+    print("=" * 100)
+
+    for group_value in summary[group_col].unique():
+        print("\n" + "#" * 100)
+        print(f"{group_col} = {group_value}")
+        print("#" * 100)
+
+        asins_in_group = summary.loc[summary[group_col] == group_value, "asin"].tolist()
+
+        for asin in asins_in_group:
+            one = out[(out[group_col] == group_value) & (out["asin"] == asin)].copy()
+            one = one.sort_values("horizon")
+
+            true_sum = one[true_col].sum()
+            pred_sum = one[pred_col].sum()
+            ratio = pred_sum / (true_sum + 1e-8)
+
+            print("\n" + "-" * 80)
+            print(f"ASIN={asin} | true_sum={true_sum:.2f} | pred_sum={pred_sum:.2f} | ratio={ratio:.3f}")
+            print("-" * 80)
+
+            display(
+                one[["horizon", "order_week", true_col, pred_col, "err", "ratio"]]
+                .round(3)
+            )
+
+    return out, summary
+
+
+gl_sample_traj, gl_sample_summary = sample_asin_trajectories_by_group(
+    pred_df=pred_df,
+    data_raw1=data_raw1,
+    group_col="gl_product_group",
+    target="instock",
+    n_per_group=5,
+    min_asins_per_group=5,
+    seed=42,
+)
