@@ -1637,219 +1637,100 @@ def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
 
 
 def print_exposure_diagnostics(pred_df):
+    """
+    Compact diagnostics only:
+      1) overall mean / ratio / WAPE / corr / active AUC
+      2) by-horizon mean / ratio / WAPE / active AUC for buy_box and in_stock
+      3) final compact summary
+    """
     print("\n" + "=" * 100)
     print("MODEL EXPOSURE METRICS")
     print("=" * 100)
     model_tbl = exposure_metrics(pred_df, prefix="pred")
     print(model_tbl.round(5).to_string(index=False))
 
-    print("\n" + "=" * 100)
-    print("BY HORIZON: IN_STOCK_DPH")
-    print("=" * 100)
-    rows = []
-    for h, g in pred_df.groupby("horizon"):
-        y = g["true_instock_dph"].values
-        p = g["pred_instock_dph"].values
-        rows.append({
-            "horizon":    h,
-            "true_mean":  np.mean(y),
-            "pred_mean":  np.mean(p),
-            "ratio":      np.mean(p) / (np.mean(y) + 1e-8),
-            "WAPE":       _wape(y, p),
-            "underbias":  np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
-            "overbias":   np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
-            "corr":       _corr(y, p),
-            "active_AUC": _auc((y > 0).astype(int), p),
-        })
-    by_h = pd.DataFrame(rows)
-    print(by_h.round(4).to_string(index=False))
+    by_horizon_tables = {}
+    target_specs = [
+        ("buy_box", "true_buy_box_dph", "pred_buy_box_dph"),
+        ("in_stock", "true_instock_dph", "pred_instock_dph"),
+    ]
 
-    # ── naive baseline 对比 ───────────────────────────────────
-    naive_cols = {
-        "naive_last":   "pred_instock_dph_last",
-        "naive_mean4":  "pred_instock_dph_mean4",
-        "naive_mean13": "pred_instock_dph_mean13",
-    }
-    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+    for name, true_col, pred_col in target_specs:
+        if true_col not in pred_df.columns or pred_col not in pred_df.columns:
+            continue
 
-    if available_naive:
         print("\n" + "=" * 100)
-        print("MODEL VS NAIVE: IN_STOCK_DPH (overall)")
+        print(f"BY HORIZON: {name.upper()}")
         print("=" * 100)
-        comp_rows = []
-        y_all = pred_df["true_instock_dph"].values
-        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
-            if col not in pred_df.columns:
-                continue
-            p_all = pred_df[col].values
-            comp_rows.append({
-                "method":     name,
-                "ratio":      np.mean(p_all) / (np.mean(y_all) + 1e-8),
-                "WAPE":       _wape(y_all, p_all),
-                "active_AUC": _auc((y_all > 0).astype(int), p_all),
-                "corr":       _corr(y_all, p_all),
+        rows = []
+        for h, g in pred_df.groupby("horizon"):
+            y = g[true_col].values
+            p = g[pred_col].values
+            rows.append({
+                "horizon": h,
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "corr": _corr(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+                "true_zero_rate": np.mean(y <= 0),
+                "pred_zero_rate": np.mean(p <= 0),
             })
-        print(pd.DataFrame(comp_rows).round(4).to_string(index=False))
+        by_h = pd.DataFrame(rows)
+        by_horizon_tables[name] = by_h
+        print(by_h.round(4).to_string(index=False))
 
-        print("\n" + "=" * 100)
-        print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
-        print("=" * 100)
-        pred_df["_block"] = pd.cut(
-            pred_df["horizon"],
-            bins=[0, 5, 12, 20],
-            labels=["short_1_5", "mid_6_12", "long_13_20"],
-        )
-        block_rows = []
-        for block, g in pred_df.groupby("_block", observed=True):
-            y_b = g["true_instock_dph"].values
-            for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
-                if col not in g.columns:
-                    continue
-                p_b = g[col].values
-                block_rows.append({
-                    "block":      block,
-                    "method":     name,
-                    "ratio":      np.mean(p_b) / (np.mean(y_b) + 1e-8),
-                    "WAPE":       _wape(y_b, p_b),
-                    "active_AUC": _auc((y_b > 0).astype(int), p_b),
-                    "corr":       _corr(y_b, p_b),
-                })
-        print(pd.DataFrame(block_rows).round(4).to_string(index=False))
-        pred_df.drop(columns=["_block"], inplace=True, errors="ignore")
-
-    # ── p_active诊断 ─────────────────────────────────────────
-    p_active_cols = [c for c in ["p_active_total", "p_active_buy_box", "p_active_instock"]
-                     if c in pred_df.columns]
-    if p_active_cols:
-        print("\n" + "=" * 100)
-        print("P_ACTIVE BY HORIZON (should NOT be monotonically increasing)")
-        print("=" * 100)
-        pa_rows = []
-        for h, g in pred_df.groupby("horizon"):
-            row = {"horizon": h}
-            for c in p_active_cols:
-                row[c] = g[c].mean()
-            # 和真实active rate对比
-            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
-            pa_rows.append(row)
-        pa_df = pd.DataFrame(pa_rows)
-        print(pa_df.round(4).to_string(index=False))
-
-        # 快速判断
-        pa_instock = pa_df["p_active_instock"].values if "p_active_instock" in pa_df.columns else None
-        if pa_instock is not None:
-            is_monotone = all(pa_instock[i] <= pa_instock[i+1] for i in range(len(pa_instock)-1))
-            print(f"\np_active_instock monotonically increasing: {is_monotone}")
-            if is_monotone:
-                print("  ⚠️  Still monotone — BCE may still be too strong")
-            else:
-                print("  ✅  Not monotone — BCE is calibrated correctly")
-
-    # ── gamma / gate诊断 ─────────────────────────────────────
-    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock"] if c in pred_df.columns]
-    if gamma_gate_cols:
-        print("\n" + "=" * 100)
-        print("GAMMA / GATE BY HORIZON: IN_STOCK")
-        print("=" * 100)
-        gg_rows = []
-        for h, g in pred_df.groupby("horizon"):
-            row = {"horizon": h}
-            if "gamma_instock" in g.columns:
-                row["gamma_instock_mean"] = g["gamma_instock"].mean()
-            if "gate_instock" in g.columns:
-                row["gate_instock_mean"] = g["gate_instock"].mean()
-            if "p_active_instock" in g.columns:
-                row["p_active_instock_mean"] = g["p_active_instock"].mean()
-            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
-            gg_rows.append(row)
-        print(pd.DataFrame(gg_rows).round(4).to_string(index=False))
-
-    # ── ASIN级别诊断 ─────────────────────────────────────────
-    print("\n" + "=" * 100)
-    print("ASIN-LEVEL 20-WEEK SUM")
-    print("=" * 100)
-    asin_sum = pred_df.groupby("asin").agg(
-        true_sum=("true_instock_dph", "sum"),
-        pred_sum=("pred_instock_dph", "sum"),
-    ).reset_index()
-    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
-    asin_sum["wape"]  = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
-    print(f"ASIN-sum Spearman: {_safe_spearman(asin_sum['true_sum'], asin_sum['pred_sum']):.4f}")
-    print(f"Median ASIN ratio: {asin_sum['ratio'].median():.4f}")
-    print(f"Median ASIN WAPE:  {asin_sum['wape'].median():.4f}")
-    print(f"p90 ASIN WAPE:     {asin_sum['wape'].quantile(0.90):.4f}")
-
-    # ── 快速判断总结 ──────────────────────────────────────────
-    print("\n" + "=" * 100)
-    print("QUICK JUDGMENT")
-    print("=" * 100)
-    h1  = by_h[by_h["horizon"] == 1].iloc[0]
-    h20 = by_h[by_h["horizon"] == 20].iloc[0]
-    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
-    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
-    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
-    ratio_ok  = 0.85 <= h20["ratio"] <= 1.15
-    auc_ok    = h20["active_AUC"] >= 0.70
-    drop_ok   = (h1["active_AUC"] - h20["active_AUC"]) < 0.20
-    print(f"\nh=20 ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
-    print(f"h=20 AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
-    print(f"AUC drop < 0.20:           {'✅' if drop_ok else '❌'}")
-
-    # ── Final compact summary table ─────────────────────────
     print("\n" + "=" * 100)
     print("FINAL SUMMARY TABLE")
     print("=" * 100)
     final_rows = []
-    model_overall = model_tbl[model_tbl["target"] == "in_stock_dph"].iloc[0]
-    final_rows.append({
-        "section": "overall_instock",
-        "ratio": model_overall["pred_true_ratio"],
-        "WAPE": model_overall["WAPE"],
-        "corr": model_overall["corr"],
-        "active_AUC": model_overall["active_AUC"],
-        "note": "model overall",
-    })
-    if available_naive:
-        for name, col in available_naive.items():
-            p_all = pred_df[col].values
+    for target_name, row_name in [("buy_box_dph", "overall_buybox"), ("in_stock_dph", "overall_instock")]:
+        sub = model_tbl[model_tbl["target"] == target_name]
+        if len(sub):
+            r = sub.iloc[0]
             final_rows.append({
-                "section": name,
-                "ratio": np.mean(p_all) / (np.mean(y_all) + 1e-8),
-                "WAPE": _wape(y_all, p_all),
-                "corr": _corr(y_all, p_all),
-                "active_AUC": _auc((y_all > 0).astype(int), p_all),
-                "note": "baseline",
+                "section": row_name,
+                "ratio": r["pred_true_ratio"],
+                "WAPE": r["WAPE"],
+                "corr": r["corr"],
+                "active_AUC": r["active_AUC"],
+                "true_mean": r["true_mean"],
+                "pred_mean": r["pred_mean"],
             })
-    final_rows.append({
-        "section": "h1_instock",
-        "ratio": h1["ratio"],
-        "WAPE": h1["WAPE"],
-        "corr": h1["corr"],
-        "active_AUC": h1["active_AUC"],
-        "note": "short horizon",
-    })
-    final_rows.append({
-        "section": "h20_instock",
-        "ratio": h20["ratio"],
-        "WAPE": h20["WAPE"],
-        "corr": h20["corr"],
-        "active_AUC": h20["active_AUC"],
-        "note": "long horizon",
-    })
-    if "p_active_instock" in pred_df.columns:
-        final_rows.append({
-            "section": "p_active_gap",
-            "ratio": np.nan,
-            "WAPE": np.nan,
-            "corr": np.nan,
-            "active_AUC": np.nan,
-            "note": f"mean p_active - true_active = {((pred_df['p_active_instock'].mean()) - ((pred_df['true_instock_dph'] > 0).mean())):.4f}",
-        })
+
+    for key, label in [("buy_box", "buybox"), ("in_stock", "instock")]:
+        by_h = by_horizon_tables.get(key)
+        if by_h is not None and len(by_h):
+            h1 = by_h[by_h["horizon"] == 1].iloc[0]
+            h20 = by_h[by_h["horizon"] == by_h["horizon"].max()].iloc[0]
+            final_rows.append({
+                "section": f"h1_{label}",
+                "ratio": h1["ratio"],
+                "WAPE": h1["WAPE"],
+                "corr": h1["corr"],
+                "active_AUC": h1["active_AUC"],
+                "true_mean": h1["true_mean"],
+                "pred_mean": h1["pred_mean"],
+            })
+            final_rows.append({
+                "section": f"h20_{label}",
+                "ratio": h20["ratio"],
+                "WAPE": h20["WAPE"],
+                "corr": h20["corr"],
+                "active_AUC": h20["active_AUC"],
+                "true_mean": h20["true_mean"],
+                "pred_mean": h20["pred_mean"],
+            })
+
     final_summary = pd.DataFrame(final_rows)
     print(final_summary.round(4).to_string(index=False))
 
-    return {"model": model_tbl, "by_horizon": by_h, "final_summary": final_summary}
-
+    return {
+        "model": model_tbl,
+        "by_horizon": by_horizon_tables,
+        "final_summary": final_summary,
+    }
 
 
 # ============================================================
@@ -2370,8 +2251,6 @@ def run_exposure_v2(
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     exposure_hat_for_demand = make_external_hat_df(pred_df)
 
     return {
@@ -2738,8 +2617,6 @@ def _train_one_exposure_window(
     pred_df["backtest_offset"] = int(val_start_offset)
 
     diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     return {
         "model": model,
         "forecast_df": pred_df,
@@ -2805,7 +2682,7 @@ def run_exposure_v2(
     adaptive_zero_propagate_to_instock=True,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
+    print("EXPOSURE MODEL V2: COMPACT + ADAPTIVE BUYBOX ZERO")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -2878,38 +2755,12 @@ def run_exposure_v2(
         # Recompute diagnostics after zero fix, because these are the predictions passed downstream.
         out["diagnostics"] = print_exposure_diagnostics(pred_df)
 
-    # GL-level diagnostics are useful because GL groups have different seasonal/burst patterns.
-    # Use original data_raw1, not the filtered/model dataframe, because the latter may drop GL columns.
-    gl_source_df = data_raw1
-
-    gl_diag = diagnose_by_gl_group(pred_df, gl_source_df, target="instock", min_asins=30, top_n=30)
-    gl_block_diag = diagnose_by_gl_horizon_block(pred_df, gl_source_df, target="instock", min_asins=30)
-    gl_summary = summarize_gl_diagnostics(gl_diag, min_asins=30)
-
-    # Since downstream demand currently uses buy_box only, also print/save buy_box GL diagnostics.
-    gl_diag_buybox = diagnose_by_gl_group(pred_df, gl_source_df, target="buybox", min_asins=30, top_n=30)
-    gl_block_diag_buybox = diagnose_by_gl_horizon_block(pred_df, gl_source_df, target="buybox", min_asins=30)
-    gl_summary_buybox = summarize_gl_diagnostics(gl_diag_buybox, min_asins=30)
-
-    out["diagnostics"]["gl_group"] = gl_diag
-    out["diagnostics"]["gl_horizon_block"] = gl_block_diag
-    out["diagnostics"]["gl_summary"] = gl_summary
-    out["diagnostics"]["gl_group_buybox"] = gl_diag_buybox
-    out["diagnostics"]["gl_horizon_block_buybox"] = gl_block_diag_buybox
-    out["diagnostics"]["gl_summary_buybox"] = gl_summary_buybox
-
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
         "context_cols": context_cols,
         "context_dim": context_dim,
         "data": data,
         "source_df": df,
-        "gl_diagnostics": gl_diag,
-        "gl_horizon_block_diagnostics": gl_block_diag,
-        "gl_summary": gl_summary,
-        "gl_diagnostics_buybox": gl_diag_buybox,
-        "gl_horizon_block_diagnostics_buybox": gl_block_diag_buybox,
-        "gl_summary_buybox": gl_summary_buybox,
         "adaptive_buybox_threshold_table": adaptive_buybox_threshold_table,
         "adaptive_buybox_gl_threshold_table": adaptive_buybox_gl_threshold_table,
     })
