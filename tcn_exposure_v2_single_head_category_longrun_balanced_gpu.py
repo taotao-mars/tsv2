@@ -6,7 +6,9 @@
 #   - keep a small auxiliary active head only for diagnostics / representation learning
 #   - keep GL diagnostics and final summary table
 #   - add category_code code/frequency/unknown static features without changing run input API
-# Purpose: stabilize point exposure forecasts and add finer category structure before graph.
+#   - add ENN one-z-per-window regime conditioning WITHOUT multiplicative active gate
+#   - add path-level peak/top-k/under-peak losses to protect high exposure regime
+# Purpose: stabilize point exposure forecasts and learn joint 20-week exposure regimes.
 # Long-run balanced preset:
 #   - category_code is kept
 #   - channel-specific zero loss is softened to avoid systematic underprediction
@@ -869,13 +871,29 @@ class TCNDecoderWithCrossAttn(nn.Module):
                  active_feat_indices=None,
                  mag_feat_indices=None,
                  active_feat_dim=0,
-                 mag_feat_dim=0):
+                 mag_feat_dim=0,
+                 use_enn=True,
+                 z_dim=8,
+                 residual_scale=2.0,
+                 gate_temperature=1.0):
         super().__init__()
         self.horizon = horizon
         self.anchor_indices = anchor_indices
         self.active_feat_indices = active_feat_indices
         self.mag_feat_indices = mag_feat_indices
-        self.residual_scale = 2.0
+        self.use_enn = bool(use_enn)
+        self.z_dim = int(z_dim)
+        self.residual_scale = float(residual_scale)
+        self.gate_temperature = float(gate_temperature)
+
+        if self.use_enn:
+            self.z_proj = nn.Sequential(
+                nn.Linear(self.z_dim, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.z_proj = None
 
         # future_context + horizon position encoding -> hidden
         self.input_proj = nn.Sequential(
@@ -900,8 +918,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
         )
         self.post_norm = nn.LayerNorm(d_model)
 
-        # Auxiliary occurrence head, only for diagnostics / small auxiliary loss.
-        active_in = d_model + max(active_feat_dim, 0)
+        # Auxiliary occurrence head. With ENN, z controls the 20-week active/zero regime.
+        z_extra = d_model if self.use_enn else 0
+        active_in = d_model + z_extra + max(active_feat_dim, 0)
         self.active_head = nn.Sequential(
             nn.Linear(active_in, hidden),
             nn.ReLU(),
@@ -909,10 +928,9 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Linear(hidden, 3),
         )
 
-        # Direct single exposure head.
-        # It receives z_out plus both event-driven and product/static features,
-        # so it can learn occurrence + magnitude jointly without an explicit gate.
-        direct_in = d_model + max(active_feat_dim, 0) + max(mag_feat_dim, 0)
+        # Direct single-head exposure head. With ENN, z controls level/peak/zero regime.
+        # IMPORTANT: p_active is auxiliary only and does NOT gate final predictions.
+        direct_in = d_model + z_extra + max(active_feat_dim, 0) + max(mag_feat_dim, 0)
         self.direct_head = nn.Sequential(
             nn.Linear(direct_in, hidden),
             nn.ReLU(),
@@ -924,7 +942,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
             nn.Tanh(),
         )
 
-    def forward(self, enc_out, future_context, return_aux=False):
+    def forward(self, enc_out, future_context, return_aux=False, z=None):
         B, H, _ = future_context.shape
 
         h_idx = torch.arange(H, device=future_context.device).float()
@@ -933,28 +951,46 @@ class TCNDecoderWithCrossAttn(nn.Module):
         hcos = torch.cos(2 * torch.pi * h_norm)
 
         x = torch.cat([future_context, hsin, hcos], dim=-1)
-        z = self.input_proj(x)
+        dec = self.input_proj(x)
         for block in self.tcn:
-            z = block(z)
+            dec = block(dec)
 
-        q = self.dec_proj(z)
+        q = self.dec_proj(dec)
         attn_out, attn_w = self.cross_attn(
             q, enc_out, enc_out,
             need_weights=return_aux,
         )
         z_out = self.post_norm(q + attn_out)  # [B,H,D]
 
+        # One latent z per ASIN-window; repeat across horizon to learn joint path regime.
+        z_emb = None
+        if self.use_enn:
+            if z is None:
+                z = torch.randn(B, self.z_dim, device=future_context.device, dtype=future_context.dtype)
+            z_emb = self.z_proj(z)                         # [B,D]
+            z_rep = z_emb[:, None, :].expand(B, H, -1)      # [B,H,D]
+        else:
+            z = None
+            z_rep = None
+
+        active_parts = [z_out]
+        if z_rep is not None:
+            active_parts.append(z_rep)
+
         active_feats = None
         if self.active_feat_indices and len(self.active_feat_indices) > 0:
             active_feats = future_context[:, :, self.active_feat_indices]
-            active_in = torch.cat([z_out, active_feats], dim=-1)
-        else:
-            active_in = z_out
+            active_parts.append(active_feats)
 
+        active_in = torch.cat(active_parts, dim=-1)
         active_logit = self.active_head(active_in)
-        p_active = torch.sigmoid(active_logit)
+        # Auxiliary active probability for diagnostics/loss only.
+        # It does NOT multiply the final exposure prediction.
+        p_active = torch.sigmoid(active_logit / max(self.gate_temperature, 1e-6))
 
         direct_parts = [z_out]
+        if z_rep is not None:
+            direct_parts.append(z_rep)
         if active_feats is not None:
             direct_parts.append(active_feats)
 
@@ -966,8 +1002,7 @@ class TCNDecoderWithCrossAttn(nn.Module):
         direct_in = torch.cat(direct_parts, dim=-1)
         residual = self.direct_head(direct_in)  # [-1, 1]
 
-        # Anchor-residual direct log forecast.
-        # Anchor is historical mean13 log DPH; residual lets the model move up/down.
+        # Anchor-residual magnitude log forecast.
         if self.anchor_indices is not None:
             ti, bi, ii = self.anchor_indices
             anchor = torch.stack([
@@ -975,26 +1010,33 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 future_context[:, :, bi],
                 future_context[:, :, ii],
             ], dim=-1)
-            raw_log_hat = anchor + residual * self.residual_scale
+            raw_log_mag = anchor + residual * self.residual_scale
         else:
-            raw_log_hat = residual * self.residual_scale
+            raw_log_mag = residual * self.residual_scale
 
-        # Non-negative log1p prediction. softplus avoids hard clipping gradients.
-        log_hat = F.softplus(raw_log_hat)
+        log_mag = F.softplus(raw_log_mag)
+        mag_level = torch.expm1(log_mag).clamp(min=0.0)
+
+        # NO multiplicative gate. This stays a single-head direct forecast.
+        # z enters the direct head, so zero/peak/transition regimes are learned by
+        # shifting the path prediction itself, not by p_active * magnitude.
+        gate = torch.ones_like(p_active)
+        pred_level = mag_level
+        log_hat = log_mag
 
         if return_aux:
             nan_like = torch.full_like(log_hat, float("nan"))
-            one_like = torch.ones_like(log_hat)
             return {
-                "log_hat": log_hat,
+                "log_hat": log_hat,             # final direct log1p prediction, no gate
                 "active_logit": active_logit,
                 "p_active": p_active,
-                # compatibility with existing diagnostics/loss call
-                "log_mag": log_hat,
-                "mag_level": torch.expm1(log_hat).clamp(min=0.0),
+                "log_mag": log_mag,             # ungated magnitude log1p prediction
+                "mag_level": mag_level,
+                "pred_level": pred_level,
                 "gamma": nan_like,
-                "gate": one_like,
+                "gate": gate,
                 "residual": residual,
+                "z": z,
                 "attn_weights": attn_w,
             }
         return log_hat
@@ -1049,8 +1091,13 @@ class ExposureForecastModelV2(nn.Module):
 
     def __init__(self, input_dim, context_dim,
                  d_model=64, horizon=20, n_heads=4, dropout=0.10,
-                 context_cols=None, use_encoder_self_attn=True):
+                 context_cols=None, use_encoder_self_attn=True,
+                 use_enn=True, z_dim=8, residual_scale=2.0, gate_temperature=1.0):
         super().__init__()
+        self.use_enn = use_enn
+        self.z_dim = int(z_dim)
+        print(f"Exposure ENN regime enabled: {use_enn} | z_dim={z_dim}")
+
         self.encoder = HistoryEncoderFull(
             input_dim=input_dim,
             d_model=d_model,
@@ -1109,11 +1156,15 @@ class ExposureForecastModelV2(nn.Module):
             mag_feat_indices=mag_feat_indices,
             active_feat_dim=len(active_feat_indices),
             mag_feat_dim=len(mag_feat_indices),
+            use_enn=use_enn,
+            z_dim=z_dim,
+            residual_scale=residual_scale,
+            gate_temperature=gate_temperature,
         )
 
-    def forward(self, x, future_context, return_aux=False):
+    def forward(self, x, future_context, return_aux=False, z=None):
         enc_out = self.encoder(x)
-        return self.decoder(enc_out, future_context, return_aux=return_aux)
+        return self.decoder(enc_out, future_context, return_aux=return_aux, z=z)
 
 
 # ============================================================
@@ -1143,6 +1194,19 @@ def exposure_hurdle_loss(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
+    # ENN/path-regime terms
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    # Peak/path-high regime terms. These prevent zero losses from making the model too conservative.
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
 ):
     """
     Single-head direct exposure loss with channel-specific zero awareness.
@@ -1245,12 +1309,64 @@ def exposure_hurdle_loss(
     active_rate_true = active_label.mean(dim=(0, 1))
     active_calib_loss = (torch.abs(active_rate_pred - active_rate_true) * tw.view(3)).mean()
 
+    # 6) Path/regime losses for ENN.
+    # These target the observed failure mode: true future is zero or active->zero,
+    # but the model keeps a positive floor every week.
+    pred_instock = pred_level[..., 2]
+    true_instock_y = true[..., 2]
+
+    true_path_zero = (true_instock_y.sum(dim=1) <= 0).float()
+    pred_path_sum = pred_instock.sum(dim=1)
+    path_zero_loss = (true_path_zero * torch.log1p(pred_path_sum)).mean()
+
+    true_zero_instock = (true_instock_y <= 0).float()
+    pred_positive_soft = torch.sigmoid((pred_instock - zero_fp_threshold) / max(zero_fp_temperature, 1e-6))
+    zero_fp_loss = (true_zero_instock * pred_positive_soft * horizon_w.squeeze(-1)).mean()
+
+    true_active_count = (true_instock_y > 0).float().sum(dim=1)
+    pred_active_count = pred_positive_soft.sum(dim=1)
+    active_count_loss = F.smooth_l1_loss(pred_active_count, true_active_count)
+
+    true_path_sum_log = torch.log1p(true_instock_y.sum(dim=1).clamp_min(0.0))
+    pred_path_sum_log = torch.log1p(pred_path_sum.clamp_min(0.0))
+    path_sum_loss = F.smooth_l1_loss(pred_path_sum_log, true_path_sum_log)
+
+    # 7) Peak/path-high losses for ENN.
+    # These target the opposite failure mode of zero losses: peak compression.
+    # Use in_stock as the main business-critical exposure channel.
+    true_peak = true_instock_y.max(dim=1).values
+    pred_peak = pred_instock.max(dim=1).values
+    peak_loss = F.smooth_l1_loss(torch.log1p(pred_peak), torch.log1p(true_peak))
+
+    k = int(max(1, min(int(peak_topk), true_instock_y.shape[1])))
+    true_topk = torch.topk(true_instock_y, k=k, dim=1).values
+    pred_topk = torch.topk(pred_instock, k=k, dim=1).values
+    topk_peak_loss = F.smooth_l1_loss(torch.log1p(pred_topk), torch.log1p(true_topk))
+
+    # High under-loss: if the target is in the high tail, underpredicting is especially costly.
+    # Detach threshold so it is a data-dependent weighting, not a learned target.
+    flat_true = true_instock_y.detach().reshape(-1)
+    if flat_true.numel() > 0 and torch.max(flat_true) > 0:
+        high_th = torch.quantile(flat_true, float(peak_quantile))
+    else:
+        high_th = torch.tensor(0.0, dtype=true_instock_y.dtype, device=true_instock_y.device)
+    high_mask = (true_instock_y >= high_th).float() * (true_instock_y > 0).float()
+    peak_under = F.relu(torch.log1p(true_instock_y) - torch.log1p(pred_instock))
+    peak_under_loss = (peak_under * high_mask).sum() / high_mask.sum().clamp_min(1.0)
+
     return (
         mag_weight * direct_loss
         + mean_weight * mean_loss
         + bce_weight * bce_loss
         + active_calib_weight * active_calib_loss
         + zero_loss
+        + path_zero_weight * path_zero_loss
+        + zero_fp_weight * zero_fp_loss
+        + active_count_weight * active_count_loss
+        + path_sum_weight * path_sum_loss
+        + peak_weight * peak_loss
+        + topk_peak_weight * topk_peak_loss
+        + peak_under_weight * peak_under_loss
     )
 
 # ============================================================
@@ -1270,6 +1386,17 @@ def train_exposure_model_v2(
     total_zero_consistency_weight=0.01,
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25, high_weight_alpha=0.35,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
+    zero_fp_threshold=50.0,
+    zero_fp_temperature=20.0,
     device=None,
 ):
     device = get_device(device)
@@ -1306,6 +1433,17 @@ def train_exposure_model_v2(
                 buy_zero_consistency_weight=buy_zero_consistency_weight,
                 horizon_weight_alpha=horizon_weight_alpha,
                 high_weight_alpha=high_weight_alpha,
+                path_zero_weight=path_zero_weight,
+                zero_fp_weight=zero_fp_weight,
+                active_count_weight=active_count_weight,
+                path_sum_weight=path_sum_weight,
+                peak_weight=peak_weight,
+                topk_peak_weight=topk_peak_weight,
+                peak_under_weight=peak_under_weight,
+                peak_topk=peak_topk,
+                peak_quantile=peak_quantile,
+                zero_fp_threshold=zero_fp_threshold,
+                zero_fp_temperature=zero_fp_temperature,
             )
             opt.zero_grad()
             loss.backward()
@@ -1341,6 +1479,17 @@ def train_exposure_model_v2(
                     buy_zero_consistency_weight=buy_zero_consistency_weight,
                     horizon_weight_alpha=horizon_weight_alpha,
                     high_weight_alpha=high_weight_alpha,
+                    path_zero_weight=path_zero_weight,
+                    zero_fp_weight=zero_fp_weight,
+                    active_count_weight=active_count_weight,
+                    path_sum_weight=path_sum_weight,
+                    peak_weight=peak_weight,
+                    topk_peak_weight=topk_peak_weight,
+                    peak_under_weight=peak_under_weight,
+                    peak_topk=peak_topk,
+                    peak_quantile=peak_quantile,
+                    zero_fp_threshold=zero_fp_threshold,
+                    zero_fp_temperature=zero_fp_temperature,
                 )
                 va_sum += loss.item() * b["x"].shape[0]
                 va_n   += b["x"].shape[0]
@@ -1369,7 +1518,7 @@ def train_exposure_model_v2(
 # 预测（输出格式与原版完全相同，多了p_active诊断列）
 # ============================================================
 
-def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None):
+def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None, mc_samples=20, mc_reduce="median"):
     device = get_device(device)
     model = model.to(device)
     rows = []
@@ -1377,11 +1526,34 @@ def predict_exposure_v2(model, va_ld, apply_funnel_constraint=True, device=None)
     with torch.no_grad():
         for b in va_ld:
             b = batch_to_device(b, device)
-            aux  = model(b["x"], b["future_context"], return_aux=True)
-            pred = torch.expm1(aux["log_hat"]).clamp(min=0.0).cpu().numpy()
-            pact = aux["p_active"].cpu().numpy()
-            gamma_np = aux.get("gamma", torch.full_like(aux["p_active"], float("nan"))).cpu().numpy()
-            gate_np = aux.get("gate", torch.full_like(aux["p_active"], float("nan"))).cpu().numpy()
+            # MC inference over ENN z. Median is more robust than mean for exposure hats,
+            # because mean can be pulled up by high-regime samples.
+            preds, pacts, gates = [], [], []
+            last_aux = None
+            K = max(int(mc_samples), 1)
+            for _ in range(K):
+                aux = model(b["x"], b["future_context"], return_aux=True)
+                last_aux = aux
+                preds.append(torch.expm1(aux["log_hat"]).clamp(min=0.0))
+                pacts.append(aux["p_active"])
+                gates.append(aux.get("gate", torch.full_like(aux["p_active"], float("nan"))))
+
+            pred_stack = torch.stack(preds, dim=0)
+            pact_stack = torch.stack(pacts, dim=0)
+            gate_stack = torch.stack(gates, dim=0)
+            if mc_reduce == "mean":
+                pred_t = pred_stack.mean(dim=0)
+                pact_t = pact_stack.mean(dim=0)
+                gate_t = gate_stack.mean(dim=0)
+            else:
+                pred_t = pred_stack.median(dim=0).values
+                pact_t = pact_stack.mean(dim=0)
+                gate_t = gate_stack.median(dim=0).values
+
+            pred = pred_t.cpu().numpy()
+            pact = pact_t.cpu().numpy()
+            gamma_np = last_aux.get("gamma", torch.full_like(last_aux["p_active"], float("nan"))).cpu().numpy()
+            gate_np = gate_t.cpu().numpy()
 
             if apply_funnel_constraint:
                 pred[:, :, 1] = np.minimum(pred[:, :, 1], pred[:, :, 0])
@@ -1898,6 +2070,199 @@ def make_external_hat_df(pred_df):
 
 
 # ============================================================
+# Adaptive buy-box near-zero correction
+# ============================================================
+
+def build_asin_adaptive_buybox_threshold(
+    data_df,
+    cutoff_week=None,
+    asin_col="asin",
+    week_col="order_week",
+    buybox_col="buy_box_dph",
+    gl_col="gl_product_group",
+    min_threshold=1.0,
+    mean_frac=0.05,
+    q90_frac=0.02,
+    q50_frac=0.10,
+    min_history_obs=8,
+):
+    """
+    Build ASIN-specific near-zero thresholds from historical buy_box scale only.
+
+    cutoff_week should be the first forecast week. Rows with order_week >= cutoff_week
+    are excluded to avoid using future holdout information.
+
+    threshold_i = max(
+        min_threshold,
+        mean_frac * historical_mean,
+        q90_frac * historical_q90,
+        q50_frac * historical_median,
+    )
+    """
+    if buybox_col not in data_df.columns:
+        raise ValueError(f"Missing required column: {buybox_col}")
+
+    df = data_df.copy()
+    df[asin_col] = df[asin_col].astype(str)
+    if week_col in df.columns:
+        df[week_col] = pd.to_datetime(df[week_col])
+        if cutoff_week is not None:
+            cutoff_week = pd.to_datetime(cutoff_week)
+            df = df[df[week_col] < cutoff_week].copy()
+
+    bb = df[buybox_col].fillna(0.0).clip(lower=0.0)
+    df["__bb__"] = bb
+
+    meta_cols = [asin_col]
+    if gl_col in df.columns:
+        meta_cols.append(gl_col)
+    meta = df[meta_cols].drop_duplicates(asin_col).copy()
+
+    g = (
+        df.groupby(asin_col)["__bb__"]
+        .agg(
+            bb_mean="mean",
+            bb_median="median",
+            bb_q75=lambda x: np.quantile(x, 0.75),
+            bb_q90=lambda x: np.quantile(x, 0.90),
+            bb_q95=lambda x: np.quantile(x, 0.95),
+            bb_zero_rate=lambda x: (x <= 0).mean(),
+            n_hist="count",
+        )
+        .reset_index()
+    )
+
+    g = g.merge(meta, on=asin_col, how="left")
+
+    g["asin_threshold_raw"] = np.maximum.reduce([
+        np.full(len(g), float(min_threshold)),
+        float(mean_frac) * g["bb_mean"].values,
+        float(q90_frac) * g["bb_q90"].values,
+        float(q50_frac) * g["bb_median"].values,
+    ])
+
+    # If an ASIN has too little historical data, keep the raw threshold but mark it.
+    g["low_history_flag"] = (g["n_hist"] < int(min_history_obs)).astype(int)
+    g["asin_threshold"] = g["asin_threshold_raw"]
+    return g
+
+
+def apply_asin_adaptive_buybox_zero_fix(
+    pred_df,
+    data_df,
+    min_threshold=1.0,
+    mean_frac=0.05,
+    q90_frac=0.02,
+    q50_frac=0.10,
+    min_history_obs=8,
+    use_gl_clip=True,
+    gl_low_q=0.10,
+    gl_high_q=0.90,
+    default_threshold=None,
+    propagate_to_instock=True,
+    verbose=True,
+):
+    """
+    Apply ASIN-scale adaptive near-zero correction to pred_buy_box_dph.
+
+    This is intentionally post-processing, not a two-head gate:
+      - it preserves the single-head magnitude model
+      - it only sets near-zero predicted buy_box values to exact zero
+      - threshold is ASIN-specific and based on historical buy_box scale
+
+    If use_gl_clip=True, extreme ASIN thresholds are clipped to the GL group's
+    historical threshold range, which is safer for very noisy ASINs.
+    """
+    required = ["asin", "order_week", "pred_buy_box_dph"]
+    missing = [c for c in required if c not in pred_df.columns]
+    if missing:
+        raise ValueError(f"pred_df missing columns: {missing}")
+
+    out = pred_df.copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+    cutoff_week = out["order_week"].min()
+
+    th = build_asin_adaptive_buybox_threshold(
+        data_df=data_df,
+        cutoff_week=cutoff_week,
+        min_threshold=min_threshold,
+        mean_frac=mean_frac,
+        q90_frac=q90_frac,
+        q50_frac=q50_frac,
+        min_history_obs=min_history_obs,
+    )
+
+    if default_threshold is None:
+        default_threshold = float(np.nanmedian(th["asin_threshold"])) if len(th) else float(min_threshold)
+
+    gl_clip = None
+    if use_gl_clip and "gl_product_group" in th.columns:
+        gl_clip = (
+            th.groupby("gl_product_group")["asin_threshold"]
+            .agg(
+                gl_th_low=lambda x: np.quantile(x, gl_low_q),
+                gl_th_high=lambda x: np.quantile(x, gl_high_q),
+                gl_th_median="median",
+                n_asins="count",
+            )
+            .reset_index()
+        )
+        th = th.merge(gl_clip, on="gl_product_group", how="left")
+        th["asin_threshold_final"] = th["asin_threshold"].clip(
+            lower=th["gl_th_low"],
+            upper=th["gl_th_high"],
+        )
+    else:
+        th["asin_threshold_final"] = th["asin_threshold"]
+
+    merge_cols = ["asin", "asin_threshold", "asin_threshold_final", "bb_mean", "bb_median", "bb_q90", "bb_q95", "bb_zero_rate", "n_hist", "low_history_flag"]
+    if "gl_product_group" in th.columns:
+        merge_cols.append("gl_product_group")
+
+    out = out.merge(th[merge_cols], on="asin", how="left")
+    out["asin_threshold_final"] = out["asin_threshold_final"].fillna(default_threshold)
+    out["asin_threshold"] = out["asin_threshold"].fillna(default_threshold)
+
+    out["pred_buy_box_dph_raw"] = out["pred_buy_box_dph"]
+    out["buybox_zero_threshold"] = out["asin_threshold_final"]
+    out["buybox_zero_fixed"] = (out["pred_buy_box_dph_raw"] <= out["buybox_zero_threshold"]).astype(int)
+    out["pred_buy_box_dph"] = np.where(
+        out["buybox_zero_fixed"].astype(bool),
+        0.0,
+        out["pred_buy_box_dph_raw"],
+    )
+
+    if propagate_to_instock and "pred_instock_dph" in out.columns:
+        out["pred_instock_dph_raw_before_buybox_zero_fix"] = out["pred_instock_dph"]
+        out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
+
+    if "pred_total_dph" in out.columns:
+        out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
+        if "pred_instock_dph" in out.columns:
+            out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print("ADAPTIVE BUY-BOX ZERO FIX")
+        print("=" * 100)
+        print(f"cutoff_week used for historical thresholds: {cutoff_week}")
+        print(f"config: min={min_threshold}, mean_frac={mean_frac}, q90_frac={q90_frac}, q50_frac={q50_frac}, gl_clip={use_gl_clip}")
+        print("threshold summary:")
+        print(th["asin_threshold_final"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]).round(4).to_string())
+        print(f"buy-box values set to zero: {out['buybox_zero_fixed'].mean():.4f}")
+        if "true_buy_box_dph" in out.columns:
+            y0 = out["true_buy_box_dph"].fillna(0) <= 0
+            p0 = out["pred_buy_box_dph"] <= 0
+            print(f"true buy-box zero rate: {y0.mean():.4f}")
+            print(f"pred buy-box zero rate after fix: {p0.mean():.4f}")
+            print(f"zero recall after fix: {((y0) & (p0)).sum() / max(y0.sum(), 1):.4f}")
+            print(f"active recall after fix: {((~y0) & (~p0)).sum() / max((~y0).sum(), 1):.4f}")
+
+    return out, th, gl_clip
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -1931,6 +2296,15 @@ def run_exposure_v2(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
     dropout=0.20,    # 0.10→0.20，加强dropout防过拟合
     use_encoder_self_attn=True,
 ):
@@ -1982,6 +2356,15 @@ def run_exposure_v2(
         total_zero_consistency_weight=total_zero_consistency_weight,
         buy_zero_consistency_weight=buy_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha, high_weight_alpha=high_weight_alpha,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
     )
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
@@ -2270,6 +2653,15 @@ def _train_one_exposure_window(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
     dropout=0.20,
     use_encoder_self_attn=True,
 ):
@@ -2330,6 +2722,15 @@ def _train_one_exposure_window(
         total_zero_consistency_weight=total_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
     )
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
@@ -2380,10 +2781,28 @@ def run_exposure_v2(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
     dropout=0.20,
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
+    apply_adaptive_buybox_zero_fix=True,
+    adaptive_zero_min_threshold=1.0,
+    adaptive_zero_mean_frac=0.05,
+    adaptive_zero_q90_frac=0.02,
+    adaptive_zero_q50_frac=0.10,
+    adaptive_zero_use_gl_clip=True,
+    adaptive_zero_gl_low_q=0.10,
+    adaptive_zero_gl_high_q=0.90,
+    adaptive_zero_propagate_to_instock=True,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
@@ -2422,19 +2841,62 @@ def run_exposure_v2(
         total_zero_consistency_weight=total_zero_consistency_weight,
         horizon_weight_alpha=horizon_weight_alpha,
         high_weight_alpha=high_weight_alpha,
+        path_zero_weight=path_zero_weight,
+        zero_fp_weight=zero_fp_weight,
+        active_count_weight=active_count_weight,
+        path_sum_weight=path_sum_weight,
+        peak_weight=peak_weight,
+        topk_peak_weight=topk_peak_weight,
+        peak_under_weight=peak_under_weight,
+        peak_topk=peak_topk,
+        peak_quantile=peak_quantile,
         dropout=dropout,
         use_encoder_self_attn=use_encoder_self_attn,
     )
 
     pred_df = out["forecast_df"]
 
+    adaptive_buybox_threshold_table = None
+    adaptive_buybox_gl_threshold_table = None
+    if apply_adaptive_buybox_zero_fix:
+        # Use original data_raw1 for adaptive thresholds so ASIN/GL metadata is preserved.
+        # Thresholds are still computed only from history before cutoff_week inside the function.
+        pred_df, adaptive_buybox_threshold_table, adaptive_buybox_gl_threshold_table = apply_asin_adaptive_buybox_zero_fix(
+            pred_df=pred_df,
+            data_df=data_raw1,
+            min_threshold=adaptive_zero_min_threshold,
+            mean_frac=adaptive_zero_mean_frac,
+            q90_frac=adaptive_zero_q90_frac,
+            q50_frac=adaptive_zero_q50_frac,
+            use_gl_clip=adaptive_zero_use_gl_clip,
+            gl_low_q=adaptive_zero_gl_low_q,
+            gl_high_q=adaptive_zero_gl_high_q,
+            propagate_to_instock=adaptive_zero_propagate_to_instock,
+            verbose=True,
+        )
+        out["forecast_df"] = pred_df
+        # Recompute diagnostics after zero fix, because these are the predictions passed downstream.
+        out["diagnostics"] = print_exposure_diagnostics(pred_df)
+
     # GL-level diagnostics are useful because GL groups have different seasonal/burst patterns.
-    gl_diag = diagnose_by_gl_group(pred_df, df, target="instock", min_asins=30, top_n=30)
-    gl_block_diag = diagnose_by_gl_horizon_block(pred_df, df, target="instock", min_asins=30)
+    # Use original data_raw1, not the filtered/model dataframe, because the latter may drop GL columns.
+    gl_source_df = data_raw1
+
+    gl_diag = diagnose_by_gl_group(pred_df, gl_source_df, target="instock", min_asins=30, top_n=30)
+    gl_block_diag = diagnose_by_gl_horizon_block(pred_df, gl_source_df, target="instock", min_asins=30)
     gl_summary = summarize_gl_diagnostics(gl_diag, min_asins=30)
+
+    # Since downstream demand currently uses buy_box only, also print/save buy_box GL diagnostics.
+    gl_diag_buybox = diagnose_by_gl_group(pred_df, gl_source_df, target="buybox", min_asins=30, top_n=30)
+    gl_block_diag_buybox = diagnose_by_gl_horizon_block(pred_df, gl_source_df, target="buybox", min_asins=30)
+    gl_summary_buybox = summarize_gl_diagnostics(gl_diag_buybox, min_asins=30)
+
     out["diagnostics"]["gl_group"] = gl_diag
     out["diagnostics"]["gl_horizon_block"] = gl_block_diag
     out["diagnostics"]["gl_summary"] = gl_summary
+    out["diagnostics"]["gl_group_buybox"] = gl_diag_buybox
+    out["diagnostics"]["gl_horizon_block_buybox"] = gl_block_diag_buybox
+    out["diagnostics"]["gl_summary_buybox"] = gl_summary_buybox
 
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
@@ -2445,6 +2907,11 @@ def run_exposure_v2(
         "gl_diagnostics": gl_diag,
         "gl_horizon_block_diagnostics": gl_block_diag,
         "gl_summary": gl_summary,
+        "gl_diagnostics_buybox": gl_diag_buybox,
+        "gl_horizon_block_diagnostics_buybox": gl_block_diag_buybox,
+        "gl_summary_buybox": gl_summary_buybox,
+        "adaptive_buybox_threshold_table": adaptive_buybox_threshold_table,
+        "adaptive_buybox_gl_threshold_table": adaptive_buybox_gl_threshold_table,
     })
     return out
 
@@ -2480,6 +2947,15 @@ def run_exposure_v2_rolling(
     buy_zero_consistency_weight=0.05,
     horizon_weight_alpha=0.25,
     high_weight_alpha=0.35,
+    path_zero_weight=0.08,
+    zero_fp_weight=0.08,
+    active_count_weight=0.05,
+    path_sum_weight=0.05,
+    peak_weight=0.08,
+    topk_peak_weight=0.05,
+    peak_under_weight=0.08,
+    peak_topk=3,
+    peak_quantile=0.80,
     dropout=0.20,
     use_scot_intersection=True,
     use_encoder_self_attn=True,
@@ -2591,25 +3067,45 @@ def run_exposure_v2_rolling(
 def _attach_gl_product_group(pred_df, source_df):
     """
     Attach one GL product group per ASIN to a prediction dataframe.
-    This uses source_df after sampling/filtering when available.
+    Robust to source_df variants: gl_product_group, gl_product_group_desc, product_group, or gl.
     """
     tmp = pred_df.copy()
     tmp["asin"] = tmp["asin"].astype(str)
 
-    if source_df is None or "gl_product_group" not in source_df.columns:
+    if source_df is None or "asin" not in source_df.columns:
+        print("No valid source_df/asin for GL diagnostics. Use MISSING.")
+        tmp["gl_product_group"] = "MISSING"
+        return tmp
+
+    possible_cols = [
+        "gl_product_group",
+        "gl_product_group_desc",
+        "gl_product_group_code",
+        "product_group",
+        "gl",
+    ]
+    gl_col = None
+    for c in possible_cols:
+        if c in source_df.columns:
+            gl_col = c
+            break
+
+    if gl_col is None:
+        print("No GL column found. Use MISSING for GL diagnostics.")
+        print("Available group-like columns:", [c for c in source_df.columns if ("gl" in c.lower() or "group" in c.lower() or "category" in c.lower())])
         tmp["gl_product_group"] = "MISSING"
         return tmp
 
     gl_map = (
-        source_df[["asin", "gl_product_group"]]
+        source_df[["asin", gl_col]]
         .dropna(subset=["asin"])
         .drop_duplicates("asin")
         .copy()
     )
     gl_map["asin"] = gl_map["asin"].astype(str)
-    gl_map["gl_product_group"] = gl_map["gl_product_group"].astype(str).fillna("MISSING")
+    gl_map["gl_product_group"] = gl_map[gl_col].astype(str).fillna("MISSING")
 
-    tmp = tmp.merge(gl_map, on="asin", how="left")
+    tmp = tmp.merge(gl_map[["asin", "gl_product_group"]], on="asin", how="left")
     tmp["gl_product_group"] = tmp["gl_product_group"].astype(str).fillna("MISSING")
     return tmp
 
@@ -2807,6 +3303,12 @@ def run_exposure_v2_final_scot_5000(
     patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
+    apply_adaptive_buybox_zero_fix=True,
+    adaptive_zero_min_threshold=1.0,
+    adaptive_zero_mean_frac=0.05,
+    adaptive_zero_q90_frac=0.02,
+    adaptive_zero_q50_frac=0.10,
+    adaptive_zero_use_gl_clip=True,
 ):
     """
     Final single-window setup:
@@ -2829,6 +3331,12 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
+        apply_adaptive_buybox_zero_fix=apply_adaptive_buybox_zero_fix,
+        adaptive_zero_min_threshold=adaptive_zero_min_threshold,
+        adaptive_zero_mean_frac=adaptive_zero_mean_frac,
+        adaptive_zero_q90_frac=adaptive_zero_q90_frac,
+        adaptive_zero_q50_frac=adaptive_zero_q50_frac,
+        adaptive_zero_use_gl_clip=adaptive_zero_use_gl_clip,
     )
 
 # ============================================================
