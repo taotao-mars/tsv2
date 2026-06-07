@@ -2788,9 +2788,11 @@ def run_exposure_v2(
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
+    use_group_seasonality=True,
+    min_cat_asins=30,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
+    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION + GROUP SEASONALITY")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -2800,6 +2802,18 @@ def run_exposure_v2(
 
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
+
+    # D version: add GL/category x month seasonality priors BEFORE load_exposure_data().
+    # load_exposure_data() will automatically include D_GROUP_SEASONALITY_COLS in context_cols.
+    group_seasonality_cols = []
+    group_seasonality_tables = None
+    if use_group_seasonality:
+        df, group_seasonality_cols, group_seasonality_tables = add_group_category_month_seasonality_priors(
+            df,
+            horizon=horizon,
+            min_cat_asins=min_cat_asins,
+        )
+        print_D_feature_summary(df, group_seasonality_cols)
 
     data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
