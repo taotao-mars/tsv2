@@ -346,6 +346,187 @@ def add_explicit_event_features(df, week_col="order_week", event_window_weeks=4)
     return out, event_cols
 
 
+
+# ============================================================
+# D VERSION ADD-ON: GROUP/CATEGORY × MONTH SEASONALITY PRIORS
+# No hard zero calibration. These are future-known calendar priors
+# estimated from history before the final holdout cutoff.
+# ============================================================
+
+D_GROUP_SEASONALITY_COLS = [
+    "gl_month_buybox_ratio",
+    "gl_month_buybox_zero_rate",
+    "gl_month_buybox_q90_ratio",
+    "cat_month_buybox_ratio",
+    "cat_month_buybox_zero_rate",
+    "cat_month_buybox_q90_ratio",
+    "is_quarter_end_month",
+    "is_holiday_q4",
+    "is_summer",
+    "is_spring",
+    "is_back_to_school",
+]
+
+
+def _d_q90(x):
+    return float(np.quantile(pd.Series(x).fillna(0.0).astype(float).values, 0.90))
+
+
+def _d_zero_rate(x):
+    s = pd.Series(x).fillna(0.0).astype(float)
+    return float((s <= 0).mean())
+
+
+def _infer_final_holdout_cutoff_week(df, horizon=20, week_col="order_week"):
+    weeks = sorted(pd.to_datetime(df[week_col]).dropna().unique())
+    if len(weeks) <= horizon:
+        raise ValueError(f"Not enough weeks to infer cutoff: n_weeks={len(weeks)}, horizon={horizon}")
+    return pd.Timestamp(weeks[-horizon])
+
+
+def add_group_category_month_seasonality_priors(
+    df,
+    horizon=20,
+    cutoff_week=None,
+    min_cat_asins=30,
+    gl_col="gl_product_group",
+    cat_col="category_code",
+    week_col="order_week",
+    buybox_col="buy_box_dph",
+):
+    """
+    Add GL/category × month seasonality priors for the exposure model.
+
+    Important: the priors are computed only from rows with order_week < cutoff_week,
+    so the final 20-week holdout is not used to build features.
+    """
+    out = df.copy()
+    out[week_col] = pd.to_datetime(out[week_col])
+    out["order_month"] = out[week_col].dt.month.astype(int)
+
+    if gl_col not in out.columns:
+        out[gl_col] = "UNKNOWN_GL"
+    if cat_col not in out.columns:
+        out[cat_col] = "UNKNOWN_CAT"
+
+    out[gl_col] = out[gl_col].astype(str).fillna("UNKNOWN_GL")
+    out[cat_col] = out[cat_col].astype(str).fillna("UNKNOWN_CAT")
+
+    out["is_quarter_end_month"] = out["order_month"].isin([3, 6, 9, 12]).astype(float)
+    out["is_holiday_q4"] = out["order_month"].isin([11, 12]).astype(float)
+    out["is_summer"] = out["order_month"].isin([6, 7, 8]).astype(float)
+    out["is_spring"] = out["order_month"].isin([3, 4, 5]).astype(float)
+    out["is_back_to_school"] = out["order_month"].isin([8, 9]).astype(float)
+
+    if cutoff_week is None:
+        cutoff_week = _infer_final_holdout_cutoff_week(out, horizon=horizon, week_col=week_col)
+    cutoff_week = pd.Timestamp(cutoff_week)
+
+    hist = out[out[week_col] < cutoff_week].copy()
+    if hist.empty:
+        raise ValueError("No historical rows before cutoff_week for D seasonality priors.")
+
+    eps = 1e-8
+
+    gl_base = (
+        hist.groupby(gl_col, dropna=False)
+        .agg(
+            gl_base_mean=(buybox_col, "mean"),
+            gl_base_q90=(buybox_col, _d_q90),
+            gl_base_zero_rate=(buybox_col, _d_zero_rate),
+            gl_hist_n_asins=("asin", "nunique"),
+        )
+        .reset_index()
+    )
+
+    gl_month = (
+        hist.groupby([gl_col, "order_month"], dropna=False)
+        .agg(
+            gl_month_mean=(buybox_col, "mean"),
+            gl_month_q90=(buybox_col, _d_q90),
+            gl_month_zero_rate=(buybox_col, _d_zero_rate),
+            gl_month_n_asins=("asin", "nunique"),
+        )
+        .reset_index()
+        .merge(gl_base, on=gl_col, how="left")
+    )
+    gl_month["gl_month_buybox_ratio"] = gl_month["gl_month_mean"] / (gl_month["gl_base_mean"] + eps)
+    gl_month["gl_month_buybox_q90_ratio"] = gl_month["gl_month_q90"] / (gl_month["gl_base_q90"] + eps)
+    gl_month["gl_month_buybox_zero_rate"] = gl_month["gl_month_zero_rate"]
+
+    cat_base = (
+        hist.groupby([gl_col, cat_col], dropna=False)
+        .agg(
+            cat_base_mean=(buybox_col, "mean"),
+            cat_base_q90=(buybox_col, _d_q90),
+            cat_base_zero_rate=(buybox_col, _d_zero_rate),
+            cat_hist_n_asins=("asin", "nunique"),
+        )
+        .reset_index()
+    )
+
+    cat_month = (
+        hist.groupby([gl_col, cat_col, "order_month"], dropna=False)
+        .agg(
+            cat_month_mean=(buybox_col, "mean"),
+            cat_month_q90=(buybox_col, _d_q90),
+            cat_month_zero_rate=(buybox_col, _d_zero_rate),
+            cat_month_n_asins=("asin", "nunique"),
+        )
+        .reset_index()
+        .merge(cat_base, on=[gl_col, cat_col], how="left")
+    )
+    cat_month["cat_month_buybox_ratio"] = cat_month["cat_month_mean"] / (cat_month["cat_base_mean"] + eps)
+    cat_month["cat_month_buybox_q90_ratio"] = cat_month["cat_month_q90"] / (cat_month["cat_base_q90"] + eps)
+    cat_month["cat_month_buybox_zero_rate"] = cat_month["cat_month_zero_rate"]
+
+    # Rare categories: fallback to GL-month priors instead of noisy category-month priors.
+    rare_mask = cat_month["cat_hist_n_asins"].fillna(0) < min_cat_asins
+    cat_month.loc[rare_mask, ["cat_month_buybox_ratio", "cat_month_buybox_q90_ratio", "cat_month_buybox_zero_rate"]] = np.nan
+
+    out = out.merge(
+        gl_month[[gl_col, "order_month", "gl_month_buybox_ratio", "gl_month_buybox_zero_rate", "gl_month_buybox_q90_ratio"]],
+        on=[gl_col, "order_month"],
+        how="left",
+    )
+    out = out.merge(
+        cat_month[[gl_col, cat_col, "order_month", "cat_month_buybox_ratio", "cat_month_buybox_zero_rate", "cat_month_buybox_q90_ratio"]],
+        on=[gl_col, cat_col, "order_month"],
+        how="left",
+    )
+
+    # Fallbacks: category -> GL -> neutral.
+    out["gl_month_buybox_ratio"] = out["gl_month_buybox_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.05, 5.0)
+    out["gl_month_buybox_q90_ratio"] = out["gl_month_buybox_q90_ratio"].replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.05, 5.0)
+    out["gl_month_buybox_zero_rate"] = out["gl_month_buybox_zero_rate"].replace([np.inf, -np.inf], np.nan).fillna(hist[buybox_col].le(0).mean()).clip(0.0, 1.0)
+
+    out["cat_month_buybox_ratio"] = out["cat_month_buybox_ratio"].replace([np.inf, -np.inf], np.nan).fillna(out["gl_month_buybox_ratio"]).fillna(1.0).clip(0.05, 5.0)
+    out["cat_month_buybox_q90_ratio"] = out["cat_month_buybox_q90_ratio"].replace([np.inf, -np.inf], np.nan).fillna(out["gl_month_buybox_q90_ratio"]).fillna(1.0).clip(0.05, 5.0)
+    out["cat_month_buybox_zero_rate"] = out["cat_month_buybox_zero_rate"].replace([np.inf, -np.inf], np.nan).fillna(out["gl_month_buybox_zero_rate"]).fillna(hist[buybox_col].le(0).mean()).clip(0.0, 1.0)
+
+    for c in D_GROUP_SEASONALITY_COLS:
+        out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+
+    tables = {
+        "cutoff_week": cutoff_week,
+        "gl_month_table": gl_month,
+        "cat_month_table": cat_month,
+        "feature_cols": list(D_GROUP_SEASONALITY_COLS),
+    }
+
+    return out, list(D_GROUP_SEASONALITY_COLS), tables
+
+
+def print_D_feature_summary(df, feature_cols):
+    print("\n" + "=" * 90)
+    print("D GROUP-SEASONALITY FEATURES")
+    print("=" * 90)
+    print("features:", feature_cols)
+    keep = [c for c in feature_cols if c in df.columns]
+    if keep:
+        print(df[keep].describe(percentiles=[0.1, 0.5, 0.9]).round(4).to_string())
+
+
 def load_exposure_data(data_raw, dph_cap_q=0.995):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
@@ -399,6 +580,11 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
     df["season_summer"] = df["order_month"].isin([6, 7, 8]).astype(float)
     df["season_fall"]   = df["order_month"].isin([9, 10, 11]).astype(float)
 
+    # D version: GL/category × month seasonality priors, if already attached.
+    group_seasonality_cols = [c for c in D_GROUP_SEASONALITY_COLS if c in df.columns]
+    for c in group_seasonality_cols:
+        df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     df, explicit_event_cols = add_explicit_event_features(df, week_col="order_week")
     df, static_cols = _encode_static_features(df)
 
@@ -415,6 +601,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         + explicit_event_cols
         + ["order_month", "month_sin", "month_cos",
            "season_winter", "season_spring", "season_summer", "season_fall"]
+        + group_seasonality_cols
         # ── 商品特征（进mag_head）────────────────────────────
         + ["our_price_log_norm", "log_review_count"]
         + static_cols
@@ -1637,100 +1824,219 @@ def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
 
 
 def print_exposure_diagnostics(pred_df):
-    """
-    Compact diagnostics only:
-      1) overall mean / ratio / WAPE / corr / active AUC
-      2) by-horizon mean / ratio / WAPE / active AUC for buy_box and in_stock
-      3) final compact summary
-    """
     print("\n" + "=" * 100)
     print("MODEL EXPOSURE METRICS")
     print("=" * 100)
     model_tbl = exposure_metrics(pred_df, prefix="pred")
     print(model_tbl.round(5).to_string(index=False))
 
-    by_horizon_tables = {}
-    target_specs = [
-        ("buy_box", "true_buy_box_dph", "pred_buy_box_dph"),
-        ("in_stock", "true_instock_dph", "pred_instock_dph"),
-    ]
+    print("\n" + "=" * 100)
+    print("BY HORIZON: IN_STOCK_DPH")
+    print("=" * 100)
+    rows = []
+    for h, g in pred_df.groupby("horizon"):
+        y = g["true_instock_dph"].values
+        p = g["pred_instock_dph"].values
+        rows.append({
+            "horizon":    h,
+            "true_mean":  np.mean(y),
+            "pred_mean":  np.mean(p),
+            "ratio":      np.mean(p) / (np.mean(y) + 1e-8),
+            "WAPE":       _wape(y, p),
+            "underbias":  np.maximum(y - p, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "overbias":   np.maximum(p - y, 0).sum() / (np.abs(y).sum() + 1e-8),
+            "corr":       _corr(y, p),
+            "active_AUC": _auc((y > 0).astype(int), p),
+        })
+    by_h = pd.DataFrame(rows)
+    print(by_h.round(4).to_string(index=False))
 
-    for name, true_col, pred_col in target_specs:
-        if true_col not in pred_df.columns or pred_col not in pred_df.columns:
-            continue
+    # ── naive baseline 对比 ───────────────────────────────────
+    naive_cols = {
+        "naive_last":   "pred_instock_dph_last",
+        "naive_mean4":  "pred_instock_dph_mean4",
+        "naive_mean13": "pred_instock_dph_mean13",
+    }
+    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+
+    if available_naive:
+        print("\n" + "=" * 100)
+        print("MODEL VS NAIVE: IN_STOCK_DPH (overall)")
+        print("=" * 100)
+        comp_rows = []
+        y_all = pred_df["true_instock_dph"].values
+        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+            if col not in pred_df.columns:
+                continue
+            p_all = pred_df[col].values
+            comp_rows.append({
+                "method":     name,
+                "ratio":      np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE":       _wape(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "corr":       _corr(y_all, p_all),
+            })
+        print(pd.DataFrame(comp_rows).round(4).to_string(index=False))
 
         print("\n" + "=" * 100)
-        print(f"BY HORIZON: {name.upper()}")
+        print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
         print("=" * 100)
-        rows = []
-        for h, g in pred_df.groupby("horizon"):
-            y = g[true_col].values
-            p = g[pred_col].values
-            rows.append({
-                "horizon": h,
-                "true_mean": np.mean(y),
-                "pred_mean": np.mean(p),
-                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
-                "WAPE": _wape(y, p),
-                "corr": _corr(y, p),
-                "active_AUC": _auc((y > 0).astype(int), p),
-                "true_zero_rate": np.mean(y <= 0),
-                "pred_zero_rate": np.mean(p <= 0),
-            })
-        by_h = pd.DataFrame(rows)
-        by_horizon_tables[name] = by_h
-        print(by_h.round(4).to_string(index=False))
+        pred_df["_block"] = pd.cut(
+            pred_df["horizon"],
+            bins=[0, 5, 12, 20],
+            labels=["short_1_5", "mid_6_12", "long_13_20"],
+        )
+        block_rows = []
+        for block, g in pred_df.groupby("_block", observed=True):
+            y_b = g["true_instock_dph"].values
+            for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+                if col not in g.columns:
+                    continue
+                p_b = g[col].values
+                block_rows.append({
+                    "block":      block,
+                    "method":     name,
+                    "ratio":      np.mean(p_b) / (np.mean(y_b) + 1e-8),
+                    "WAPE":       _wape(y_b, p_b),
+                    "active_AUC": _auc((y_b > 0).astype(int), p_b),
+                    "corr":       _corr(y_b, p_b),
+                })
+        print(pd.DataFrame(block_rows).round(4).to_string(index=False))
+        pred_df.drop(columns=["_block"], inplace=True, errors="ignore")
 
+    # ── p_active诊断 ─────────────────────────────────────────
+    p_active_cols = [c for c in ["p_active_total", "p_active_buy_box", "p_active_instock"]
+                     if c in pred_df.columns]
+    if p_active_cols:
+        print("\n" + "=" * 100)
+        print("P_ACTIVE BY HORIZON (should NOT be monotonically increasing)")
+        print("=" * 100)
+        pa_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            for c in p_active_cols:
+                row[c] = g[c].mean()
+            # 和真实active rate对比
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            pa_rows.append(row)
+        pa_df = pd.DataFrame(pa_rows)
+        print(pa_df.round(4).to_string(index=False))
+
+        # 快速判断
+        pa_instock = pa_df["p_active_instock"].values if "p_active_instock" in pa_df.columns else None
+        if pa_instock is not None:
+            is_monotone = all(pa_instock[i] <= pa_instock[i+1] for i in range(len(pa_instock)-1))
+            print(f"\np_active_instock monotonically increasing: {is_monotone}")
+            if is_monotone:
+                print("  ⚠️  Still monotone — BCE may still be too strong")
+            else:
+                print("  ✅  Not monotone — BCE is calibrated correctly")
+
+    # ── gamma / gate诊断 ─────────────────────────────────────
+    gamma_gate_cols = [c for c in ["gamma_instock", "gate_instock"] if c in pred_df.columns]
+    if gamma_gate_cols:
+        print("\n" + "=" * 100)
+        print("GAMMA / GATE BY HORIZON: IN_STOCK")
+        print("=" * 100)
+        gg_rows = []
+        for h, g in pred_df.groupby("horizon"):
+            row = {"horizon": h}
+            if "gamma_instock" in g.columns:
+                row["gamma_instock_mean"] = g["gamma_instock"].mean()
+            if "gate_instock" in g.columns:
+                row["gate_instock_mean"] = g["gate_instock"].mean()
+            if "p_active_instock" in g.columns:
+                row["p_active_instock_mean"] = g["p_active_instock"].mean()
+            row["true_active_rate"] = (g["true_instock_dph"] > 0).mean()
+            gg_rows.append(row)
+        print(pd.DataFrame(gg_rows).round(4).to_string(index=False))
+
+    # ── ASIN级别诊断 ─────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("ASIN-LEVEL 20-WEEK SUM")
+    print("=" * 100)
+    asin_sum = pred_df.groupby("asin").agg(
+        true_sum=("true_instock_dph", "sum"),
+        pred_sum=("pred_instock_dph", "sum"),
+    ).reset_index()
+    asin_sum["ratio"] = asin_sum["pred_sum"] / (asin_sum["true_sum"] + 1e-8)
+    asin_sum["wape"]  = (asin_sum["pred_sum"] - asin_sum["true_sum"]).abs() / (asin_sum["true_sum"] + 1e-8)
+    print(f"ASIN-sum Spearman: {_safe_spearman(asin_sum['true_sum'], asin_sum['pred_sum']):.4f}")
+    print(f"Median ASIN ratio: {asin_sum['ratio'].median():.4f}")
+    print(f"Median ASIN WAPE:  {asin_sum['wape'].median():.4f}")
+    print(f"p90 ASIN WAPE:     {asin_sum['wape'].quantile(0.90):.4f}")
+
+    # ── 快速判断总结 ──────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("QUICK JUDGMENT")
+    print("=" * 100)
+    h1  = by_h[by_h["horizon"] == 1].iloc[0]
+    h20 = by_h[by_h["horizon"] == 20].iloc[0]
+    print(f"h=1  ratio={h1['ratio']:.3f}  WAPE={h1['WAPE']:.3f}  AUC={h1['active_AUC']:.3f}")
+    print(f"h=20 ratio={h20['ratio']:.3f}  WAPE={h20['WAPE']:.3f}  AUC={h20['active_AUC']:.3f}")
+    print(f"AUC drop h1→h20: {h1['active_AUC'] - h20['active_AUC']:.3f}  (target < 0.20)")
+    ratio_ok  = 0.85 <= h20["ratio"] <= 1.15
+    auc_ok    = h20["active_AUC"] >= 0.70
+    drop_ok   = (h1["active_AUC"] - h20["active_AUC"]) < 0.20
+    print(f"\nh=20 ratio in [0.85,1.15]: {'✅' if ratio_ok else '❌'}")
+    print(f"h=20 AUC >= 0.70:          {'✅' if auc_ok else '❌'}")
+    print(f"AUC drop < 0.20:           {'✅' if drop_ok else '❌'}")
+
+    # ── Final compact summary table ─────────────────────────
     print("\n" + "=" * 100)
     print("FINAL SUMMARY TABLE")
     print("=" * 100)
     final_rows = []
-    for target_name, row_name in [("buy_box_dph", "overall_buybox"), ("in_stock_dph", "overall_instock")]:
-        sub = model_tbl[model_tbl["target"] == target_name]
-        if len(sub):
-            r = sub.iloc[0]
+    model_overall = model_tbl[model_tbl["target"] == "in_stock_dph"].iloc[0]
+    final_rows.append({
+        "section": "overall_instock",
+        "ratio": model_overall["pred_true_ratio"],
+        "WAPE": model_overall["WAPE"],
+        "corr": model_overall["corr"],
+        "active_AUC": model_overall["active_AUC"],
+        "note": "model overall",
+    })
+    if available_naive:
+        for name, col in available_naive.items():
+            p_all = pred_df[col].values
             final_rows.append({
-                "section": row_name,
-                "ratio": r["pred_true_ratio"],
-                "WAPE": r["WAPE"],
-                "corr": r["corr"],
-                "active_AUC": r["active_AUC"],
-                "true_mean": r["true_mean"],
-                "pred_mean": r["pred_mean"],
+                "section": name,
+                "ratio": np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE": _wape(y_all, p_all),
+                "corr": _corr(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "note": "baseline",
             })
-
-    for key, label in [("buy_box", "buybox"), ("in_stock", "instock")]:
-        by_h = by_horizon_tables.get(key)
-        if by_h is not None and len(by_h):
-            h1 = by_h[by_h["horizon"] == 1].iloc[0]
-            h20 = by_h[by_h["horizon"] == by_h["horizon"].max()].iloc[0]
-            final_rows.append({
-                "section": f"h1_{label}",
-                "ratio": h1["ratio"],
-                "WAPE": h1["WAPE"],
-                "corr": h1["corr"],
-                "active_AUC": h1["active_AUC"],
-                "true_mean": h1["true_mean"],
-                "pred_mean": h1["pred_mean"],
-            })
-            final_rows.append({
-                "section": f"h20_{label}",
-                "ratio": h20["ratio"],
-                "WAPE": h20["WAPE"],
-                "corr": h20["corr"],
-                "active_AUC": h20["active_AUC"],
-                "true_mean": h20["true_mean"],
-                "pred_mean": h20["pred_mean"],
-            })
-
+    final_rows.append({
+        "section": "h1_instock",
+        "ratio": h1["ratio"],
+        "WAPE": h1["WAPE"],
+        "corr": h1["corr"],
+        "active_AUC": h1["active_AUC"],
+        "note": "short horizon",
+    })
+    final_rows.append({
+        "section": "h20_instock",
+        "ratio": h20["ratio"],
+        "WAPE": h20["WAPE"],
+        "corr": h20["corr"],
+        "active_AUC": h20["active_AUC"],
+        "note": "long horizon",
+    })
+    if "p_active_instock" in pred_df.columns:
+        final_rows.append({
+            "section": "p_active_gap",
+            "ratio": np.nan,
+            "WAPE": np.nan,
+            "corr": np.nan,
+            "active_AUC": np.nan,
+            "note": f"mean p_active - true_active = {((pred_df['p_active_instock'].mean()) - ((pred_df['true_instock_dph'] > 0).mean())):.4f}",
+        })
     final_summary = pd.DataFrame(final_rows)
     print(final_summary.round(4).to_string(index=False))
 
-    return {
-        "model": model_tbl,
-        "by_horizon": by_horizon_tables,
-        "final_summary": final_summary,
-    }
+    return {"model": model_tbl, "by_horizon": by_h, "final_summary": final_summary}
+
 
 
 # ============================================================
@@ -1951,199 +2257,6 @@ def make_external_hat_df(pred_df):
 
 
 # ============================================================
-# Adaptive buy-box near-zero correction
-# ============================================================
-
-def build_asin_adaptive_buybox_threshold(
-    data_df,
-    cutoff_week=None,
-    asin_col="asin",
-    week_col="order_week",
-    buybox_col="buy_box_dph",
-    gl_col="gl_product_group",
-    min_threshold=1.0,
-    mean_frac=0.05,
-    q90_frac=0.02,
-    q50_frac=0.10,
-    min_history_obs=8,
-):
-    """
-    Build ASIN-specific near-zero thresholds from historical buy_box scale only.
-
-    cutoff_week should be the first forecast week. Rows with order_week >= cutoff_week
-    are excluded to avoid using future holdout information.
-
-    threshold_i = max(
-        min_threshold,
-        mean_frac * historical_mean,
-        q90_frac * historical_q90,
-        q50_frac * historical_median,
-    )
-    """
-    if buybox_col not in data_df.columns:
-        raise ValueError(f"Missing required column: {buybox_col}")
-
-    df = data_df.copy()
-    df[asin_col] = df[asin_col].astype(str)
-    if week_col in df.columns:
-        df[week_col] = pd.to_datetime(df[week_col])
-        if cutoff_week is not None:
-            cutoff_week = pd.to_datetime(cutoff_week)
-            df = df[df[week_col] < cutoff_week].copy()
-
-    bb = df[buybox_col].fillna(0.0).clip(lower=0.0)
-    df["__bb__"] = bb
-
-    meta_cols = [asin_col]
-    if gl_col in df.columns:
-        meta_cols.append(gl_col)
-    meta = df[meta_cols].drop_duplicates(asin_col).copy()
-
-    g = (
-        df.groupby(asin_col)["__bb__"]
-        .agg(
-            bb_mean="mean",
-            bb_median="median",
-            bb_q75=lambda x: np.quantile(x, 0.75),
-            bb_q90=lambda x: np.quantile(x, 0.90),
-            bb_q95=lambda x: np.quantile(x, 0.95),
-            bb_zero_rate=lambda x: (x <= 0).mean(),
-            n_hist="count",
-        )
-        .reset_index()
-    )
-
-    g = g.merge(meta, on=asin_col, how="left")
-
-    g["asin_threshold_raw"] = np.maximum.reduce([
-        np.full(len(g), float(min_threshold)),
-        float(mean_frac) * g["bb_mean"].values,
-        float(q90_frac) * g["bb_q90"].values,
-        float(q50_frac) * g["bb_median"].values,
-    ])
-
-    # If an ASIN has too little historical data, keep the raw threshold but mark it.
-    g["low_history_flag"] = (g["n_hist"] < int(min_history_obs)).astype(int)
-    g["asin_threshold"] = g["asin_threshold_raw"]
-    return g
-
-
-def apply_asin_adaptive_buybox_zero_fix(
-    pred_df,
-    data_df,
-    min_threshold=1.0,
-    mean_frac=0.05,
-    q90_frac=0.02,
-    q50_frac=0.10,
-    min_history_obs=8,
-    use_gl_clip=True,
-    gl_low_q=0.10,
-    gl_high_q=0.90,
-    default_threshold=None,
-    propagate_to_instock=True,
-    verbose=True,
-):
-    """
-    Apply ASIN-scale adaptive near-zero correction to pred_buy_box_dph.
-
-    This is intentionally post-processing, not a two-head gate:
-      - it preserves the single-head magnitude model
-      - it only sets near-zero predicted buy_box values to exact zero
-      - threshold is ASIN-specific and based on historical buy_box scale
-
-    If use_gl_clip=True, extreme ASIN thresholds are clipped to the GL group's
-    historical threshold range, which is safer for very noisy ASINs.
-    """
-    required = ["asin", "order_week", "pred_buy_box_dph"]
-    missing = [c for c in required if c not in pred_df.columns]
-    if missing:
-        raise ValueError(f"pred_df missing columns: {missing}")
-
-    out = pred_df.copy()
-    out["asin"] = out["asin"].astype(str)
-    out["order_week"] = pd.to_datetime(out["order_week"])
-    cutoff_week = out["order_week"].min()
-
-    th = build_asin_adaptive_buybox_threshold(
-        data_df=data_df,
-        cutoff_week=cutoff_week,
-        min_threshold=min_threshold,
-        mean_frac=mean_frac,
-        q90_frac=q90_frac,
-        q50_frac=q50_frac,
-        min_history_obs=min_history_obs,
-    )
-
-    if default_threshold is None:
-        default_threshold = float(np.nanmedian(th["asin_threshold"])) if len(th) else float(min_threshold)
-
-    gl_clip = None
-    if use_gl_clip and "gl_product_group" in th.columns:
-        gl_clip = (
-            th.groupby("gl_product_group")["asin_threshold"]
-            .agg(
-                gl_th_low=lambda x: np.quantile(x, gl_low_q),
-                gl_th_high=lambda x: np.quantile(x, gl_high_q),
-                gl_th_median="median",
-                n_asins="count",
-            )
-            .reset_index()
-        )
-        th = th.merge(gl_clip, on="gl_product_group", how="left")
-        th["asin_threshold_final"] = th["asin_threshold"].clip(
-            lower=th["gl_th_low"],
-            upper=th["gl_th_high"],
-        )
-    else:
-        th["asin_threshold_final"] = th["asin_threshold"]
-
-    merge_cols = ["asin", "asin_threshold", "asin_threshold_final", "bb_mean", "bb_median", "bb_q90", "bb_q95", "bb_zero_rate", "n_hist", "low_history_flag"]
-    if "gl_product_group" in th.columns:
-        merge_cols.append("gl_product_group")
-
-    out = out.merge(th[merge_cols], on="asin", how="left")
-    out["asin_threshold_final"] = out["asin_threshold_final"].fillna(default_threshold)
-    out["asin_threshold"] = out["asin_threshold"].fillna(default_threshold)
-
-    out["pred_buy_box_dph_raw"] = out["pred_buy_box_dph"]
-    out["buybox_zero_threshold"] = out["asin_threshold_final"]
-    out["buybox_zero_fixed"] = (out["pred_buy_box_dph_raw"] <= out["buybox_zero_threshold"]).astype(int)
-    out["pred_buy_box_dph"] = np.where(
-        out["buybox_zero_fixed"].astype(bool),
-        0.0,
-        out["pred_buy_box_dph_raw"],
-    )
-
-    if propagate_to_instock and "pred_instock_dph" in out.columns:
-        out["pred_instock_dph_raw_before_buybox_zero_fix"] = out["pred_instock_dph"]
-        out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
-
-    if "pred_total_dph" in out.columns:
-        out["pred_buy_box_dph"] = np.minimum(out["pred_buy_box_dph"], out["pred_total_dph"])
-        if "pred_instock_dph" in out.columns:
-            out["pred_instock_dph"] = np.minimum(out["pred_instock_dph"], out["pred_buy_box_dph"])
-
-    if verbose:
-        print("\n" + "=" * 100)
-        print("ADAPTIVE BUY-BOX ZERO FIX")
-        print("=" * 100)
-        print(f"cutoff_week used for historical thresholds: {cutoff_week}")
-        print(f"config: min={min_threshold}, mean_frac={mean_frac}, q90_frac={q90_frac}, q50_frac={q50_frac}, gl_clip={use_gl_clip}")
-        print("threshold summary:")
-        print(th["asin_threshold_final"].describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9, 0.95]).round(4).to_string())
-        print(f"buy-box values set to zero: {out['buybox_zero_fixed'].mean():.4f}")
-        if "true_buy_box_dph" in out.columns:
-            y0 = out["true_buy_box_dph"].fillna(0) <= 0
-            p0 = out["pred_buy_box_dph"] <= 0
-            print(f"true buy-box zero rate: {y0.mean():.4f}")
-            print(f"pred buy-box zero rate after fix: {p0.mean():.4f}")
-            print(f"zero recall after fix: {((y0) & (p0)).sum() / max(y0.sum(), 1):.4f}")
-            print(f"active recall after fix: {((~y0) & (~p0)).sum() / max((~y0).sum(), 1):.4f}")
-
-    return out, th, gl_clip
-
-
-# ============================================================
 # 主入口
 # ============================================================
 
@@ -2251,6 +2364,8 @@ def run_exposure_v2(
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     diagnostics = print_exposure_diagnostics(pred_df)
+    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
+    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     exposure_hat_for_demand = make_external_hat_df(pred_df)
 
     return {
@@ -2617,6 +2732,8 @@ def _train_one_exposure_window(
     pred_df["backtest_offset"] = int(val_start_offset)
 
     diagnostics = print_exposure_diagnostics(pred_df)
+    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
+    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
     return {
         "model": model,
         "forecast_df": pred_df,
@@ -2671,18 +2788,9 @@ def run_exposure_v2(
     use_scot_intersection=True,
     val_start_offset=0,
     use_encoder_self_attn=True,
-    apply_adaptive_buybox_zero_fix=True,
-    adaptive_zero_min_threshold=1.0,
-    adaptive_zero_mean_frac=0.02,
-    adaptive_zero_q90_frac=0.01,
-    adaptive_zero_q50_frac=0.05,
-    adaptive_zero_use_gl_clip=True,
-    adaptive_zero_gl_low_q=0.10,
-    adaptive_zero_gl_high_q=0.90,
-    adaptive_zero_propagate_to_instock=False,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: COMPACT + ADAPTIVE BUYBOX ZERO")
+    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -2733,27 +2841,11 @@ def run_exposure_v2(
 
     pred_df = out["forecast_df"]
 
-    adaptive_buybox_threshold_table = None
-    adaptive_buybox_gl_threshold_table = None
-    if apply_adaptive_buybox_zero_fix:
-        # Use original data_raw1 for adaptive thresholds so ASIN/GL metadata is preserved.
-        # Thresholds are still computed only from history before cutoff_week inside the function.
-        pred_df, adaptive_buybox_threshold_table, adaptive_buybox_gl_threshold_table = apply_asin_adaptive_buybox_zero_fix(
-            pred_df=pred_df,
-            data_df=data_raw1,
-            min_threshold=adaptive_zero_min_threshold,
-            mean_frac=adaptive_zero_mean_frac,
-            q90_frac=adaptive_zero_q90_frac,
-            q50_frac=adaptive_zero_q50_frac,
-            use_gl_clip=adaptive_zero_use_gl_clip,
-            gl_low_q=adaptive_zero_gl_low_q,
-            gl_high_q=adaptive_zero_gl_high_q,
-            propagate_to_instock=adaptive_zero_propagate_to_instock,
-            verbose=True,
-        )
-        out["forecast_df"] = pred_df
-        # Recompute diagnostics after zero fix, because these are the predictions passed downstream.
-        out["diagnostics"] = print_exposure_diagnostics(pred_df)
+    # Compact GL/category check only; no long diagnostic tables printed.
+    gl_compact = compact_group_bias_check(pred_df, df, group_col="gl_product_group", target="buybox", min_asins=30, label="GL")
+    cat_compact = compact_group_bias_check(pred_df, df, group_col="category_code", target="buybox", min_asins=30, label="CATEGORY")
+    out["diagnostics"]["gl_compact_buybox"] = gl_compact
+    out["diagnostics"]["category_compact_buybox"] = cat_compact
 
     out.update({
         "exposure_hat_for_demand": make_external_hat_df(pred_df),
@@ -2761,14 +2853,14 @@ def run_exposure_v2(
         "context_dim": context_dim,
         "data": data,
         "source_df": df,
-        "adaptive_buybox_threshold_table": adaptive_buybox_threshold_table,
-        "adaptive_buybox_gl_threshold_table": adaptive_buybox_gl_threshold_table,
-        # Backward-compatible placeholders. Compact version intentionally does not compute GL diagnostics.
+        "group_seasonality_cols": group_seasonality_cols,
+        "group_seasonality_tables": group_seasonality_tables,
+        "gl_compact_buybox": gl_compact,
+        "category_compact_buybox": cat_compact,
+        # Backward-compatible keys kept intentionally empty.
         "gl_diagnostics": None,
         "gl_horizon_block_diagnostics": None,
         "gl_summary": None,
-        "rolling_gl_diagnostics": None,
-        "rolling_gl_summary": None,
     })
     return out
 
@@ -2829,6 +2921,16 @@ def run_exposure_v2_rolling(
 
     if remove_extreme:
         df = filter_extreme_asins(df, q=extreme_q)
+
+    group_seasonality_cols = []
+    group_seasonality_tables = None
+    if use_group_seasonality:
+        df, group_seasonality_cols, group_seasonality_tables = add_group_category_month_seasonality_priors(
+            df,
+            horizon=horizon,
+            min_cat_asins=min_cat_asins,
+        )
+        print_D_feature_summary(df, group_seasonality_cols)
 
     data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
@@ -2924,45 +3026,25 @@ def run_exposure_v2_rolling(
 def _attach_gl_product_group(pred_df, source_df):
     """
     Attach one GL product group per ASIN to a prediction dataframe.
-    Robust to source_df variants: gl_product_group, gl_product_group_desc, product_group, or gl.
+    This uses source_df after sampling/filtering when available.
     """
     tmp = pred_df.copy()
     tmp["asin"] = tmp["asin"].astype(str)
 
-    if source_df is None or "asin" not in source_df.columns:
-        print("No valid source_df/asin for GL diagnostics. Use MISSING.")
-        tmp["gl_product_group"] = "MISSING"
-        return tmp
-
-    possible_cols = [
-        "gl_product_group",
-        "gl_product_group_desc",
-        "gl_product_group_code",
-        "product_group",
-        "gl",
-    ]
-    gl_col = None
-    for c in possible_cols:
-        if c in source_df.columns:
-            gl_col = c
-            break
-
-    if gl_col is None:
-        print("No GL column found. Use MISSING for GL diagnostics.")
-        print("Available group-like columns:", [c for c in source_df.columns if ("gl" in c.lower() or "group" in c.lower() or "category" in c.lower())])
+    if source_df is None or "gl_product_group" not in source_df.columns:
         tmp["gl_product_group"] = "MISSING"
         return tmp
 
     gl_map = (
-        source_df[["asin", gl_col]]
+        source_df[["asin", "gl_product_group"]]
         .dropna(subset=["asin"])
         .drop_duplicates("asin")
         .copy()
     )
     gl_map["asin"] = gl_map["asin"].astype(str)
-    gl_map["gl_product_group"] = gl_map[gl_col].astype(str).fillna("MISSING")
+    gl_map["gl_product_group"] = gl_map["gl_product_group"].astype(str).fillna("MISSING")
 
-    tmp = tmp.merge(gl_map[["asin", "gl_product_group"]], on="asin", how="left")
+    tmp = tmp.merge(gl_map, on="asin", how="left")
     tmp["gl_product_group"] = tmp["gl_product_group"].astype(str).fillna("MISSING")
     return tmp
 
@@ -3160,13 +3242,8 @@ def run_exposure_v2_final_scot_5000(
     patience=10,
     batch_size=128,
     use_encoder_self_attn=True,
-    apply_adaptive_buybox_zero_fix=True,
-    adaptive_zero_min_threshold=1.0,
-    adaptive_zero_mean_frac=0.02,
-    adaptive_zero_q90_frac=0.01,
-    adaptive_zero_q50_frac=0.05,
-    adaptive_zero_use_gl_clip=True,
-    adaptive_zero_propagate_to_instock=False,
+    use_group_seasonality=True,
+    min_cat_asins=30,
 ):
     """
     Final single-window setup:
@@ -3189,13 +3266,8 @@ def run_exposure_v2_final_scot_5000(
         use_scot_intersection=True,
         val_start_offset=0,
         use_encoder_self_attn=use_encoder_self_attn,
-        apply_adaptive_buybox_zero_fix=apply_adaptive_buybox_zero_fix,
-        adaptive_zero_min_threshold=adaptive_zero_min_threshold,
-        adaptive_zero_mean_frac=adaptive_zero_mean_frac,
-        adaptive_zero_q90_frac=adaptive_zero_q90_frac,
-        adaptive_zero_q50_frac=adaptive_zero_q50_frac,
-        adaptive_zero_use_gl_clip=adaptive_zero_use_gl_clip,
-        adaptive_zero_propagate_to_instock=adaptive_zero_propagate_to_instock,
+        use_group_seasonality=use_group_seasonality,
+        min_cat_asins=min_cat_asins,
     )
 
 # ============================================================
@@ -3220,7 +3292,9 @@ def run_exposure_v2_final_scot_5000(
 # pred_df = result["forecast_df"]
 # exposure_hat_for_demand = result["exposure_hat_for_demand"]
 # diagnostics = result["diagnostics"]
-# Compact version does not compute GL diagnostics; old GL keys return None for compatibility.
+# gl_diag = result["gl_diagnostics"]
+# gl_block_diag = result["gl_horizon_block_diagnostics"]
+# gl_summary = result["gl_summary"]
 #
 # Optional no-attention ablation:
 # result_no_attn = run_exposure_v2_final_scot_5000(
@@ -3248,3 +3322,147 @@ def run_exposure_v2_final_scot_5000(
 #     use_scot_intersection=True,
 #     use_encoder_self_attn=True,
 # )
+
+
+# ============================================================
+# COMPACT DIAGNOSTICS OVERRIDE FOR D VERSION
+# Keep output short: overall metrics + buybox/instock horizon + compact group spread.
+# ============================================================
+
+
+def _metric_row(df, true_col, pred_col, name):
+    y = df[true_col].fillna(0.0).astype(float)
+    p = df[pred_col].fillna(0.0).astype(float)
+    denom = y.abs().sum() + 1e-8
+    return {
+        "target": name,
+        "true_mean": y.mean(),
+        "pred_mean": p.mean(),
+        "ratio": p.sum() / (y.sum() + 1e-8),
+        "WAPE": (p - y).abs().sum() / denom,
+        "underbias": np.maximum(y - p, 0).sum() / denom,
+        "overbias": np.maximum(p - y, 0).sum() / denom,
+        "corr": y.corr(p) if y.std() > 1e-8 and p.std() > 1e-8 else np.nan,
+        "active_AUC": _safe_auc((y > 0).astype(int).values, p.values),
+        "zero_rate_true": (y <= 0).mean(),
+        "pred_zero_rate": (p <= 0).mean(),
+    }
+
+
+def _horizon_table(df, true_col, pred_col):
+    rows = []
+    for h, g in df.groupby("horizon"):
+        rows.append(_metric_row(g, true_col, pred_col, int(h)))
+    out = pd.DataFrame(rows).rename(columns={"target": "horizon"}).sort_values("horizon")
+    return out
+
+
+def print_exposure_diagnostics(pred_df):
+    maps = [
+        ("true_total_dph", "pred_total_dph", "total_dph"),
+        ("true_buy_box_dph", "pred_buy_box_dph", "buy_box_dph"),
+        ("true_instock_dph", "pred_instock_dph", "in_stock_dph"),
+    ]
+    overall = pd.DataFrame([_metric_row(pred_df, t, p, name) for t, p, name in maps])
+    buy_h = _horizon_table(pred_df, "true_buy_box_dph", "pred_buy_box_dph")
+    instock_h = _horizon_table(pred_df, "true_instock_dph", "pred_instock_dph")
+
+    print("\n" + "=" * 90)
+    print("MODEL EXPOSURE METRICS")
+    print("=" * 90)
+    print(overall[["target", "true_mean", "pred_mean", "ratio", "WAPE", "underbias", "overbias", "corr", "active_AUC", "zero_rate_true", "pred_zero_rate"]].round(5).to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("BY HORIZON: BUY_BOX")
+    print("=" * 90)
+    print(buy_h[["horizon", "true_mean", "pred_mean", "ratio", "WAPE", "corr", "active_AUC", "zero_rate_true", "pred_zero_rate"]].round(4).to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("BY HORIZON: IN_STOCK")
+    print("=" * 90)
+    print(instock_h[["horizon", "true_mean", "pred_mean", "ratio", "WAPE", "corr", "active_AUC", "zero_rate_true", "pred_zero_rate"]].round(4).to_string(index=False))
+
+    def pick(tbl, h):
+        r = tbl[tbl["horizon"] == h]
+        return r.iloc[0] if len(r) else pd.Series(dtype=float)
+
+    final = pd.DataFrame([
+        {"section": "overall_buybox", **overall[overall["target"] == "buy_box_dph"].iloc[0].to_dict()},
+        {"section": "overall_instock", **overall[overall["target"] == "in_stock_dph"].iloc[0].to_dict()},
+        {"section": "h1_buybox", **pick(buy_h, 1).to_dict()},
+        {"section": "h20_buybox", **pick(buy_h, 20).to_dict()},
+        {"section": "h1_instock", **pick(instock_h, 1).to_dict()},
+        {"section": "h20_instock", **pick(instock_h, 20).to_dict()},
+    ])
+    keep = [c for c in ["section", "ratio", "WAPE", "corr", "active_AUC", "true_mean", "pred_mean"] if c in final.columns]
+    print("\n" + "=" * 90)
+    print("FINAL SUMMARY TABLE")
+    print("=" * 90)
+    print(final[keep].round(4).to_string(index=False))
+
+    return {"overall": overall, "buybox_by_horizon": buy_h, "instock_by_horizon": instock_h, "final_summary": final}
+
+
+def diagnose_encoder_decoder_performance(model, va_ld, pred_df=None):
+    # Keep D version output compact. Return placeholder to preserve downstream code compatibility.
+    return {"skipped": True, "reason": "compact D version"}
+
+
+def compact_group_bias_check(pred_df, source_df, group_col="gl_product_group", target="buybox", min_asins=30, label="GL"):
+    col_map = {
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "instock": ("true_instock_dph", "pred_instock_dph"),
+        "total": ("true_total_dph", "pred_total_dph"),
+    }
+    true_col, pred_col = col_map[target]
+    if group_col not in source_df.columns:
+        print(f"Skip {label} compact check: {group_col} not in source_df")
+        return pd.DataFrame()
+
+    df = pred_df.copy()
+    df["asin"] = df["asin"].astype(str)
+    mp = source_df[["asin", group_col]].drop_duplicates("asin").copy()
+    mp["asin"] = mp["asin"].astype(str)
+    df = df.merge(mp, on="asin", how="left")
+
+    rows = []
+    for k, g in df.groupby(group_col, dropna=False):
+        n_asins = g["asin"].nunique()
+        if n_asins < min_asins:
+            continue
+        y = g[true_col].fillna(0.0).astype(float)
+        p = g[pred_col].fillna(0.0).astype(float)
+        denom = y.abs().sum() + 1e-8
+        rows.append({
+            group_col: k,
+            "n_asins": n_asins,
+            "ratio": p.sum() / (y.sum() + 1e-8),
+            "WAPE": (p - y).abs().sum() / denom,
+            "underbias": np.maximum(y - p, 0).sum() / denom,
+            "overbias": np.maximum(p - y, 0).sum() / denom,
+            "true_zero_rate": (y <= 0).mean(),
+            "pred_zero_rate": (p <= 0).mean(),
+        })
+    out = pd.DataFrame(rows)
+    if len(out) == 0:
+        return out
+
+    print("\n" + "=" * 90)
+    print(f"COMPACT {label} CHECK: {target}")
+    print("=" * 90)
+    print("Most under-predicted:")
+    print(out.sort_values("ratio").head(8).round(4).to_string(index=False))
+    print("Most over-predicted:")
+    print(out.sort_values("ratio", ascending=False).head(8).round(4).to_string(index=False))
+    print("Worst WAPE:")
+    print(out.sort_values("WAPE", ascending=False).head(8).round(4).to_string(index=False))
+    print("Summary:")
+    print(pd.DataFrame([{
+        "n_groups": len(out),
+        "median_ratio": out["ratio"].median(),
+        "share_under_0.9": (out["ratio"] < 0.9).mean(),
+        "share_over_1.1": (out["ratio"] > 1.1).mean(),
+        "median_WAPE": out["WAPE"].median(),
+    }]).round(4).to_string(index=False))
+    return out
+
