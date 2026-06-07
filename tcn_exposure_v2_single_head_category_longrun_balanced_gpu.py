@@ -2673,13 +2673,13 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
     apply_adaptive_buybox_zero_fix=True,
     adaptive_zero_min_threshold=1.0,
-    adaptive_zero_mean_frac=0.05,
-    adaptive_zero_q90_frac=0.02,
-    adaptive_zero_q50_frac=0.10,
+    adaptive_zero_mean_frac=0.02,
+    adaptive_zero_q90_frac=0.01,
+    adaptive_zero_q50_frac=0.05,
     adaptive_zero_use_gl_clip=True,
     adaptive_zero_gl_low_q=0.10,
     adaptive_zero_gl_high_q=0.90,
-    adaptive_zero_propagate_to_instock=True,
+    adaptive_zero_propagate_to_instock=False,
 ):
     print("\n" + "=" * 100)
     print("EXPOSURE MODEL V2: COMPACT + ADAPTIVE BUYBOX ZERO")
@@ -2763,6 +2763,12 @@ def run_exposure_v2(
         "source_df": df,
         "adaptive_buybox_threshold_table": adaptive_buybox_threshold_table,
         "adaptive_buybox_gl_threshold_table": adaptive_buybox_gl_threshold_table,
+        # Backward-compatible placeholders. Compact version intentionally does not compute GL diagnostics.
+        "gl_diagnostics": None,
+        "gl_horizon_block_diagnostics": None,
+        "gl_summary": None,
+        "rolling_gl_diagnostics": None,
+        "rolling_gl_summary": None,
     })
     return out
 
@@ -3156,10 +3162,11 @@ def run_exposure_v2_final_scot_5000(
     use_encoder_self_attn=True,
     apply_adaptive_buybox_zero_fix=True,
     adaptive_zero_min_threshold=1.0,
-    adaptive_zero_mean_frac=0.05,
-    adaptive_zero_q90_frac=0.02,
-    adaptive_zero_q50_frac=0.10,
+    adaptive_zero_mean_frac=0.02,
+    adaptive_zero_q90_frac=0.01,
+    adaptive_zero_q50_frac=0.05,
     adaptive_zero_use_gl_clip=True,
+    adaptive_zero_propagate_to_instock=False,
 ):
     """
     Final single-window setup:
@@ -3188,6 +3195,7 @@ def run_exposure_v2_final_scot_5000(
         adaptive_zero_q90_frac=adaptive_zero_q90_frac,
         adaptive_zero_q50_frac=adaptive_zero_q50_frac,
         adaptive_zero_use_gl_clip=adaptive_zero_use_gl_clip,
+        adaptive_zero_propagate_to_instock=adaptive_zero_propagate_to_instock,
     )
 
 # ============================================================
@@ -3212,9 +3220,7 @@ def run_exposure_v2_final_scot_5000(
 # pred_df = result["forecast_df"]
 # exposure_hat_for_demand = result["exposure_hat_for_demand"]
 # diagnostics = result["diagnostics"]
-# gl_diag = result["gl_diagnostics"]
-# gl_block_diag = result["gl_horizon_block_diagnostics"]
-# gl_summary = result["gl_summary"]
+# Compact version does not compute GL diagnostics; old GL keys return None for compatibility.
 #
 # Optional no-attention ablation:
 # result_no_attn = run_exposure_v2_final_scot_5000(
