@@ -1,155 +1,59 @@
 import numpy as np
 import pandas as pd
-from IPython.display import display
 
-def attach_gl_info(df, data_raw1):
-    out = df.copy()
-    out["asin"] = out["asin"].astype(str)
+pred_df = result["forecast_df"].copy()
 
-    meta_cols = ["asin"]
-    for c in ["gl_product_group", "gl_product_group_desc", "category_code"]:
-        if c in data_raw1.columns:
-            meta_cols.append(c)
+# 如果 pred_df 里还没有 gl_product_group，就从 data_raw1 合并进来
+if "gl_product_group" not in pred_df.columns:
+    gl_map = data_raw1[["asin", "gl_product_group", "gl_product_group_desc"]].drop_duplicates("asin")
+    pred_df["asin"] = pred_df["asin"].astype(str)
+    gl_map["asin"] = gl_map["asin"].astype(str)
+    pred_df = pred_df.merge(gl_map, on="asin", how="left")
 
-    meta = data_raw1[meta_cols].drop_duplicates("asin").copy()
-    meta["asin"] = meta["asin"].astype(str)
+# 看 buy_box exposure 在不同 GL 下表现
+gl_buybox = (
+    pred_df
+    .groupby(["gl_product_group", "gl_product_group_desc"], dropna=False)
+    .apply(lambda g: pd.Series({
+        "n_asins": g["asin"].nunique(),
+        "n_rows": len(g),
 
-    out = out.merge(meta, on="asin", how="left")
-    return out
+        "true_mean": g["true_buy_box_dph"].mean(),
+        "pred_mean": g["pred_buy_box_dph"].mean(),
+        "ratio": g["pred_buy_box_dph"].sum() / (g["true_buy_box_dph"].sum() + 1e-8),
 
+        "WAPE": (g["pred_buy_box_dph"] - g["true_buy_box_dph"]).abs().sum()
+                / (g["true_buy_box_dph"].abs().sum() + 1e-8),
 
-def _safe_wape(y, yhat):
-    denom = np.abs(y).sum()
-    if denom <= 1e-8:
-        return np.nan
-    return np.abs(yhat - y).sum() / denom
+        "underbias": np.maximum(g["true_buy_box_dph"] - g["pred_buy_box_dph"], 0).sum()
+                     / (g["true_buy_box_dph"].abs().sum() + 1e-8),
 
+        "overbias": np.maximum(g["pred_buy_box_dph"] - g["true_buy_box_dph"], 0).sum()
+                    / (g["true_buy_box_dph"].abs().sum() + 1e-8),
 
-def _quantile_penalty(y, yhat, q):
-    y = np.asarray(y)
-    yhat = np.asarray(yhat)
-    err = y - yhat
-    loss = np.where(err >= 0, q * err, (1 - q) * (-err))
-    denom = np.abs(y).sum()
-    if denom <= 1e-8:
-        return np.nan
-    return loss.sum() / denom
+        "true_zero_rate": (g["true_buy_box_dph"] <= 0).mean(),
+        "pred_zero_rate": (g["pred_buy_box_dph"] <= 0).mean(),
 
+        "zero_recall": ((g["true_buy_box_dph"] <= 0) & (g["pred_buy_box_dph"] <= 0)).sum()
+                       / max((g["true_buy_box_dph"] <= 0).sum(), 1),
 
-def _under_over(y, yhat):
-    y = np.asarray(y)
-    yhat = np.asarray(yhat)
-    denom = np.abs(y).sum()
-    if denom <= 1e-8:
-        return np.nan, np.nan
-    under = np.maximum(y - yhat, 0).sum() / denom
-    over = np.maximum(yhat - y, 0).sum() / denom
-    return under, over
+        "active_recall": ((g["true_buy_box_dph"] > 0) & (g["pred_buy_box_dph"] > 0)).sum()
+                         / max((g["true_buy_box_dph"] > 0).sum(), 1),
+    }))
+    .reset_index()
+)
 
+# 只看样本足够的 GL
+gl_buybox = gl_buybox[gl_buybox["n_asins"] >= 20].copy()
 
-def demand_gl_diagnostic(
-    demand_pred_df,
-    data_raw1,
-    true_col="fbi_demand",
-    amxl_p50_col="p50_amxl",
-    amxl_p70_col="p70_amxl",
-    scot_p50_col="p50_scot",
-    scot_p70_col="p70_scot",
-    min_asins=20,
-):
-    df = attach_gl_info(demand_pred_df, data_raw1)
+print("Most under-predicted GLs:")
+display(gl_buybox.sort_values("ratio").head(10).round(4))
 
-    required = [true_col, amxl_p50_col, amxl_p70_col, scot_p50_col, scot_p70_col, "gl_product_group"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        print("Missing columns:", missing)
-        print("Available columns:", df.columns.tolist())
-        return None
+print("Most over-predicted GLs:")
+display(gl_buybox.sort_values("ratio", ascending=False).head(10).round(4))
 
-    rows = []
+print("Worst WAPE GLs:")
+display(gl_buybox.sort_values("WAPE", ascending=False).head(10).round(4))
 
-    group_cols = ["gl_product_group"]
-    if "gl_product_group_desc" in df.columns:
-        group_cols.append("gl_product_group_desc")
-
-    for keys, g in df.groupby(group_cols, dropna=False):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
-
-        n_asins = g["asin"].nunique()
-        n_rows = len(g)
-        if n_asins < min_asins:
-            continue
-
-        y = g[true_col].fillna(0).values
-
-        p50_amxl = g[amxl_p50_col].fillna(0).values
-        p70_amxl = g[amxl_p70_col].fillna(0).values
-        p50_scot = g[scot_p50_col].fillna(0).values
-        p70_scot = g[scot_p70_col].fillna(0).values
-
-        p50_amxl_wape = _safe_wape(y, p50_amxl)
-        p50_scot_wape = _safe_wape(y, p50_scot)
-        p70_amxl_wape = _safe_wape(y, p70_amxl)
-        p70_scot_wape = _safe_wape(y, p70_scot)
-
-        p50_amxl_pen = _quantile_penalty(y, p50_amxl, q=0.5)
-        p50_scot_pen = _quantile_penalty(y, p50_scot, q=0.5)
-        p70_amxl_pen = _quantile_penalty(y, p70_amxl, q=0.7)
-        p70_scot_pen = _quantile_penalty(y, p70_scot, q=0.7)
-
-        p50_under, p50_over = _under_over(y, p50_amxl)
-        p70_under, p70_over = _under_over(y, p70_amxl)
-        scot50_under, scot50_over = _under_over(y, p50_scot)
-        scot70_under, scot70_over = _under_over(y, p70_scot)
-
-        row = {
-            "gl_product_group": keys[0],
-            "n_asins": n_asins,
-            "n_rows": n_rows,
-            "total_demand": y.sum(),
-            "true_mean": y.mean(),
-
-            "p50_amxl_wape": p50_amxl_wape,
-            "p50_scot_wape": p50_scot_wape,
-            "p50_wape_improvement_bps": (p50_scot_wape - p50_amxl_wape) * 10000,
-
-            "p70_amxl_wape": p70_amxl_wape,
-            "p70_scot_wape": p70_scot_wape,
-            "p70_wape_improvement_bps": (p70_scot_wape - p70_amxl_wape) * 10000,
-
-            "p50_amxl_penalty": p50_amxl_pen,
-            "p50_scot_penalty": p50_scot_pen,
-            "p50_penalty_improvement_bps": (p50_scot_pen - p50_amxl_pen) * 10000,
-
-            "p70_amxl_penalty": p70_amxl_pen,
-            "p70_scot_penalty": p70_scot_pen,
-            "p70_penalty_improvement_bps": (p70_scot_pen - p70_amxl_pen) * 10000,
-
-            "p50_amxl_underbias": p50_under,
-            "p50_amxl_overbias": p50_over,
-            "p50_scot_underbias": scot50_under,
-            "p50_scot_overbias": scot50_over,
-
-            "p70_amxl_underbias": p70_under,
-            "p70_amxl_overbias": p70_over,
-            "p70_scot_underbias": scot70_under,
-            "p70_scot_overbias": scot70_over,
-        }
-
-        if len(keys) > 1:
-            row["gl_product_group_desc"] = keys[1]
-
-        rows.append(row)
-
-    out = pd.DataFrame(rows)
-
-    if len(out) == 0:
-        print("No GL groups passed min_asins.")
-        return out
-
-    # 排序：p50 improvement 最差的在前面
-    out = out.sort_values("p50_penalty_improvement_bps", ascending=True)
-
-    display(out.round(4))
-    return out
+print("Zero recall by GL:")
+display(gl_buybox.sort_values("zero_recall").head(10).round(4))
