@@ -2110,6 +2110,201 @@ def exposure_metrics(pred_df, prefix="pred"):
     return pd.DataFrame(rows)
 
 
+
+
+# ============================================================
+# Compact diagnostics helpers (fixed)
+# ============================================================
+
+def print_exposure_diagnostics_compact(pred_df):
+    """Compact exposure diagnostics only.
+    Keeps output short:
+      - MODEL EXPOSURE METRICS
+      - BY HORIZON: BUY_BOX
+      - BY HORIZON: IN_STOCK
+      - MODEL VS NAIVE: IN_STOCK overall + horizon blocks
+      - FINAL SUMMARY TABLE
+    """
+    def _by_horizon(target_true_col, target_pred_col):
+        rows = []
+        for h, g in pred_df.groupby("horizon"):
+            y = g[target_true_col].fillna(0.0).values
+            p = g[target_pred_col].fillna(0.0).values
+            rows.append({
+                "horizon": h,
+                "true_mean": np.mean(y),
+                "pred_mean": np.mean(p),
+                "ratio": np.mean(p) / (np.mean(y) + 1e-8),
+                "WAPE": _wape(y, p),
+                "corr": _corr(y, p),
+                "active_AUC": _auc((y > 0).astype(int), p),
+                "zero_rate_true": np.mean(y <= 0),
+                "pred_zero_rate": np.mean(p <= 0),
+            })
+        return pd.DataFrame(rows).sort_values("horizon")
+
+    overall = exposure_metrics(pred_df, prefix="pred")
+    buy_h = _by_horizon("true_buy_box_dph", "pred_buy_box_dph")
+    instock_h = _by_horizon("true_instock_dph", "pred_instock_dph")
+
+    print("\n" + "=" * 90)
+    print("MODEL EXPOSURE METRICS")
+    print("=" * 90)
+    cols = ["target", "true_mean", "pred_mean", "pred_true_ratio", "WAPE", "corr", "active_AUC", "zero_rate_true"]
+    cols = [c for c in cols if c in overall.columns]
+    print(overall[cols].round(5).to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("BY HORIZON: BUY_BOX")
+    print("=" * 90)
+    print(buy_h[["horizon", "true_mean", "pred_mean", "ratio", "WAPE", "corr", "active_AUC", "zero_rate_true", "pred_zero_rate"]].round(4).to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("BY HORIZON: IN_STOCK")
+    print("=" * 90)
+    print(instock_h[["horizon", "true_mean", "pred_mean", "ratio", "WAPE", "corr", "active_AUC", "zero_rate_true", "pred_zero_rate"]].round(4).to_string(index=False))
+
+    # Naive baseline comparison: keep this because it verifies model beats simple history baselines.
+    naive_cols = {
+        "naive_last": "pred_instock_dph_last",
+        "naive_mean4": "pred_instock_dph_mean4",
+        "naive_mean13": "pred_instock_dph_mean13",
+    }
+    available_naive = {k: v for k, v in naive_cols.items() if v in pred_df.columns}
+    naive_overall = pd.DataFrame()
+    naive_block = pd.DataFrame()
+    if available_naive:
+        y_all = pred_df["true_instock_dph"].fillna(0.0).values
+        comp_rows = []
+        for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+            p_all = pred_df[col].fillna(0.0).values
+            comp_rows.append({
+                "method": name,
+                "ratio": np.mean(p_all) / (np.mean(y_all) + 1e-8),
+                "WAPE": _wape(y_all, p_all),
+                "active_AUC": _auc((y_all > 0).astype(int), p_all),
+                "corr": _corr(y_all, p_all),
+            })
+        naive_overall = pd.DataFrame(comp_rows)
+        print("\n" + "=" * 90)
+        print("MODEL VS NAIVE: IN_STOCK_DPH (overall)")
+        print("=" * 90)
+        print(naive_overall.round(4).to_string(index=False))
+
+        tmp = pred_df.copy()
+        tmp["_block"] = pd.cut(tmp["horizon"], bins=[0, 5, 12, 20], labels=["short_1_5", "mid_6_12", "long_13_20"])
+        block_rows = []
+        for block, g in tmp.groupby("_block", observed=True):
+            y_b = g["true_instock_dph"].fillna(0.0).values
+            for name, col in [("model", "pred_instock_dph")] + list(available_naive.items()):
+                p_b = g[col].fillna(0.0).values
+                block_rows.append({
+                    "block": block,
+                    "method": name,
+                    "ratio": np.mean(p_b) / (np.mean(y_b) + 1e-8),
+                    "WAPE": _wape(y_b, p_b),
+                    "active_AUC": _auc((y_b > 0).astype(int), p_b),
+                    "corr": _corr(y_b, p_b),
+                })
+        naive_block = pd.DataFrame(block_rows)
+        print("\n" + "=" * 90)
+        print("MODEL VS NAIVE BY HORIZON BLOCK: IN_STOCK_DPH")
+        print("=" * 90)
+        print(naive_block.round(4).to_string(index=False))
+
+    def pick(tbl, h):
+        r = tbl[tbl["horizon"] == h]
+        return r.iloc[0] if len(r) else pd.Series(dtype=float)
+
+    final = pd.DataFrame([
+        {"section": "overall_buybox", **overall[overall["target"] == "buy_box_dph"].iloc[0].to_dict()},
+        {"section": "overall_instock", **overall[overall["target"] == "in_stock_dph"].iloc[0].to_dict()},
+        {"section": "h1_buybox", **pick(buy_h, 1).to_dict()},
+        {"section": "h20_buybox", **pick(buy_h, 20).to_dict()},
+        {"section": "h1_instock", **pick(instock_h, 1).to_dict()},
+        {"section": "h20_instock", **pick(instock_h, 20).to_dict()},
+    ])
+    keep = [c for c in ["section", "ratio", "pred_true_ratio", "WAPE", "corr", "active_AUC", "true_mean", "pred_mean"] if c in final.columns]
+    print("\n" + "=" * 90)
+    print("FINAL SUMMARY TABLE")
+    print("=" * 90)
+    print(final[keep].round(4).to_string(index=False))
+
+    return {
+        "overall": overall,
+        "buybox_by_horizon": buy_h,
+        "instock_by_horizon": instock_h,
+        "naive_overall": naive_overall,
+        "naive_by_block": naive_block,
+        "final_summary": final,
+    }
+
+
+def compact_group_bias_check(pred_df, source_df, group_col="gl_product_group", target="buybox", min_asins=30, label="GL"):
+    """Compact group bias check for exposure predictions."""
+    col_map = {
+        "buybox": ("true_buy_box_dph", "pred_buy_box_dph"),
+        "instock": ("true_instock_dph", "pred_instock_dph"),
+        "total": ("true_total_dph", "pred_total_dph"),
+    }
+    if target not in col_map:
+        raise ValueError("target must be buybox, instock, or total")
+    true_col, pred_col = col_map[target]
+
+    df = pred_df.copy()
+    df["asin"] = df["asin"].astype(str)
+
+    if group_col not in df.columns:
+        if group_col not in source_df.columns:
+            print(f"Skip {label} compact check: {group_col} not found")
+            return pd.DataFrame()
+        meta = source_df[["asin", group_col]].drop_duplicates("asin").copy()
+        meta["asin"] = meta["asin"].astype(str)
+        df = df.merge(meta, on="asin", how="left")
+
+    rows = []
+    for k, g in df.groupby(group_col, dropna=False):
+        n_asins = g["asin"].nunique()
+        if n_asins < min_asins:
+            continue
+        y = g[true_col].fillna(0.0).astype(float)
+        p = g[pred_col].fillna(0.0).astype(float)
+        denom = y.abs().sum() + 1e-8
+        rows.append({
+            group_col: k,
+            "n_asins": n_asins,
+            "ratio": p.sum() / (y.sum() + 1e-8),
+            "WAPE": (p - y).abs().sum() / denom,
+            "underbias": np.maximum(y - p, 0).sum() / denom,
+            "overbias": np.maximum(p - y, 0).sum() / denom,
+            "true_zero_rate": (y <= 0).mean(),
+            "pred_zero_rate": (p <= 0).mean(),
+        })
+    out = pd.DataFrame(rows)
+
+    print("\n" + "=" * 90)
+    print(f"COMPACT {label} CHECK: {target}")
+    print("=" * 90)
+    if len(out) == 0:
+        print(f"No {label} groups passed min_asins={min_asins}")
+        return out
+
+    print("Most under-predicted:")
+    print(out.sort_values("ratio").head(8).round(4).to_string(index=False))
+    print("Most over-predicted:")
+    print(out.sort_values("ratio", ascending=False).head(8).round(4).to_string(index=False))
+    print("Summary:")
+    summary = pd.DataFrame([{
+        "n_groups": len(out),
+        "median_ratio": out["ratio"].median(),
+        "share_under_0.9": (out["ratio"] < 0.9).mean(),
+        "share_over_1.1": (out["ratio"] > 1.1).mean(),
+        "median_WAPE": out["WAPE"].median(),
+    }])
+    print(summary.round(4).to_string(index=False))
+    return out
+
+
 def add_naive_baselines_from_loader(pred_df, va_ld, context_cols):
     idx   = {c: i for i, c in enumerate(context_cols)}
     modes = {
@@ -2672,9 +2867,8 @@ def run_exposure_v2(
 
     pred_df = predict_exposure_v2(model, va_ld, apply_funnel_constraint=apply_funnel_constraint)
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
-    diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
+    diagnostics = print_exposure_diagnostics_compact(pred_df)
+    diagnostics["encoder_decoder"] = {"skipped": True, "reason": "compact output"}
     exposure_hat_for_demand = make_external_hat_df(pred_df)
 
     return {
@@ -3040,9 +3234,8 @@ def _train_one_exposure_window(
     pred_df = add_naive_baselines_from_loader(pred_df, va_ld, context_cols)
     pred_df["backtest_offset"] = int(val_start_offset)
 
-    diagnostics = print_exposure_diagnostics(pred_df)
-    encoder_decoder_diagnostics = diagnose_encoder_decoder_performance(model, va_ld, pred_df=pred_df)
-    diagnostics["encoder_decoder"] = encoder_decoder_diagnostics
+    diagnostics = print_exposure_diagnostics_compact(pred_df)
+    diagnostics["encoder_decoder"] = {"skipped": True, "reason": "compact output"}
     return {
         "model": model,
         "forecast_df": pred_df,
@@ -3124,7 +3317,7 @@ def run_exposure_v2(
             horizon=horizon,
             min_cat_asins=min_cat_asins,
         )
-        print_D_feature_summary(df, group_seasonality_cols)
+        print(f"D group-seasonality features added: {len(group_seasonality_cols)}")
 
     # Graph version: KNN neighbor aggregate features around buy_box behavior.
     buybox_graph_cols = []
@@ -3135,7 +3328,7 @@ def run_exposure_v2(
             horizon=horizon,
             graph_k=graph_k,
         )
-        print_graph_feature_summary(df, buybox_graph_cols)
+        print(f"Multi-channel neighbor graph features added: {len(buybox_graph_cols)} | graph_k={graph_k}")
 
     data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
@@ -3270,7 +3463,7 @@ def run_exposure_v2_rolling(
             horizon=horizon,
             min_cat_asins=min_cat_asins,
         )
-        print_D_feature_summary(df, group_seasonality_cols)
+        print(f"D group-seasonality features added: {len(group_seasonality_cols)}")
 
     data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
