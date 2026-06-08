@@ -527,6 +527,311 @@ def print_D_feature_summary(df, feature_cols):
         print(df[keep].describe(percentiles=[0.1, 0.5, 0.9]).round(4).to_string())
 
 
+# ============================================================
+# GRAPH ADD-ON: MULTI-CHANNEL EXPOSURE NEIGHBOR AGGREGATION FEATURES
+# KNN over ASIN historical exposure behavior, buy-box focused but including total/in-stock context. No future holdout leakage:
+# uses only history before final holdout cutoff to build ASIN summaries.
+# This is NOT GraphSAGE/GAT; it is a stable first graph ablation.
+# ============================================================
+
+BUYBOX_NEIGHBOR_GRAPH_COLS = [
+    # buy-box neighbor priors: the downstream-effective exposure channel
+    "graph_bb_neighbor_mean_log",
+    "graph_bb_neighbor_q90_log",
+    "graph_bb_neighbor_q95_log",
+    "graph_bb_neighbor_zero_rate",
+    "graph_bb_neighbor_active_rate",
+    "graph_bb_neighbor_cv",
+    "graph_bb_neighbor_top20_share",
+    "graph_bb_neighbor_active_to_zero_rate",
+    "graph_bb_neighbor_zero_to_active_rate",
+
+    # total-DPH neighbor priors: raw exposure context, useful for demand opportunity scale
+    "graph_total_neighbor_mean_log",
+    "graph_total_neighbor_q90_log",
+    "graph_total_neighbor_q95_log",
+    "graph_total_neighbor_zero_rate",
+    "graph_total_neighbor_active_rate",
+    "graph_total_neighbor_cv",
+    "graph_total_neighbor_top20_share",
+
+    # in-stock-DPH neighbor priors: availability / supply-side exposure context
+    "graph_instock_neighbor_mean_log",
+    "graph_instock_neighbor_q90_log",
+    "graph_instock_neighbor_q95_log",
+    "graph_instock_neighbor_zero_rate",
+    "graph_instock_neighbor_active_rate",
+    "graph_instock_neighbor_cv",
+    "graph_instock_neighbor_top20_share",
+
+    # demand/activity and graph quality diagnostics
+    "graph_demand_neighbor_active_rate",
+    "graph_neighbor_count",
+    "graph_same_category_rate",
+    "graph_same_gl_rate",
+]
+
+
+def _g_top20_share(x):
+    x = np.asarray(pd.Series(x).fillna(0.0).clip(lower=0.0).values, dtype=float)
+    if len(x) == 0 or x.sum() <= 1e-8:
+        return 0.0
+    k = max(1, int(np.ceil(0.20 * len(x))))
+    return float(np.sort(x)[-k:].sum() / (x.sum() + 1e-8))
+
+
+def _g_transition_rates(x):
+    x = np.asarray(pd.Series(x).fillna(0.0).values, dtype=float)
+    if len(x) < 2:
+        return 0.0, 0.0
+    active = x > 0
+    prev = active[:-1]
+    nxt = active[1:]
+    a2z_den = max(prev.sum(), 1)
+    z2a_den = max((~prev).sum(), 1)
+    a2z = float((prev & (~nxt)).sum() / a2z_den)
+    z2a = float(((~prev) & nxt).sum() / z2a_den)
+    return a2z, z2a
+
+
+def add_buybox_neighbor_graph_features(
+    df,
+    horizon=20,
+    cutoff_week=None,
+    graph_k=10,
+    gl_col="gl_product_group",
+    cat_col="category_code",
+    buybox_col="buy_box_dph",
+    demand_col="fbi_demand",
+    min_same_category_pool=None,
+):
+    """
+    Add ASIN-level neighbor aggregate features based on historical exposure behavior.
+
+    The graph is buy-box focused for downstream demand, but the node features and
+    neighbor aggregates also include total_dph and in_stock_dph because they carry
+    useful demand-opportunity / availability signals.
+
+    Neighbor search priority:
+      1) same category_code if enough candidates
+      2) same GL if category pool too small
+      3) global fallback
+
+    The generated graph_* features are static per ASIN and repeated for every week.
+    This preserves the existing exposure_hat_for_demand output format.
+    """
+    out = df.copy()
+    out["asin"] = out["asin"].astype(str)
+    out["order_week"] = pd.to_datetime(out["order_week"])
+
+    if cutoff_week is None:
+        cutoff_week = _infer_final_holdout_cutoff_week(out, horizon=horizon, week_col="order_week")
+    cutoff_week = pd.to_datetime(cutoff_week)
+
+    if min_same_category_pool is None:
+        min_same_category_pool = max(int(graph_k) + 1, 5)
+
+    for c in [buybox_col, demand_col, "total_dph", "in_stock_dph", "our_price", "ind_promotion", "scot_oos"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if gl_col not in out.columns:
+        out[gl_col] = "MISSING"
+    if cat_col not in out.columns:
+        out[cat_col] = "MISSING"
+
+    out[gl_col] = out[gl_col].astype(str).fillna("MISSING")
+    out[cat_col] = out[cat_col].astype(str).fillna("MISSING")
+
+    hist = out[out["order_week"] < cutoff_week].copy()
+    if hist.empty:
+        hist = out.copy()
+
+    rows = []
+    for asin, g in hist.groupby("asin", sort=False):
+        b = g[buybox_col].fillna(0.0).clip(lower=0.0).values.astype(float)
+        t = g["total_dph"].fillna(0.0).clip(lower=0.0).values.astype(float) if "total_dph" in g.columns else np.zeros(len(g))
+        ins = g["in_stock_dph"].fillna(0.0).clip(lower=0.0).values.astype(float) if "in_stock_dph" in g.columns else np.zeros(len(g))
+        d = g[demand_col].fillna(0.0).clip(lower=0.0).values.astype(float) if demand_col in g.columns else np.zeros(len(g))
+
+        a2z, z2a = _g_transition_rates(b)
+        mean = float(np.mean(b)) if len(b) else 0.0
+        std = float(np.std(b)) if len(b) else 0.0
+
+        total_mean = float(np.mean(t)) if len(t) else 0.0
+        total_std = float(np.std(t)) if len(t) else 0.0
+        instock_mean = float(np.mean(ins)) if len(ins) else 0.0
+        instock_std = float(np.std(ins)) if len(ins) else 0.0
+
+        row = {
+            "asin": str(asin),
+            gl_col: str(g[gl_col].iloc[0]),
+            cat_col: str(g[cat_col].iloc[0]),
+            "bb_mean": mean,
+            "bb_q90": float(np.quantile(b, 0.90)) if len(b) else 0.0,
+            "bb_q95": float(np.quantile(b, 0.95)) if len(b) else 0.0,
+            "bb_zero_rate": float((b <= 0).mean()) if len(b) else 1.0,
+            "bb_active_rate": float((b > 0).mean()) if len(b) else 0.0,
+            "bb_cv": std / (mean + 1e-8),
+            "bb_top20_share": _g_top20_share(b),
+            "bb_active_to_zero_rate": a2z,
+            "bb_zero_to_active_rate": z2a,
+
+            "total_mean": total_mean,
+            "total_q90": float(np.quantile(t, 0.90)) if len(t) else 0.0,
+            "total_q95": float(np.quantile(t, 0.95)) if len(t) else 0.0,
+            "total_zero_rate": float((t <= 0).mean()) if len(t) else 1.0,
+            "total_active_rate": float((t > 0).mean()) if len(t) else 0.0,
+            "total_cv": total_std / (total_mean + 1e-8),
+            "total_top20_share": _g_top20_share(t),
+
+            "instock_mean": instock_mean,
+            "instock_q90": float(np.quantile(ins, 0.90)) if len(ins) else 0.0,
+            "instock_q95": float(np.quantile(ins, 0.95)) if len(ins) else 0.0,
+            "instock_zero_rate": float((ins <= 0).mean()) if len(ins) else 1.0,
+            "instock_active_rate": float((ins > 0).mean()) if len(ins) else 0.0,
+            "instock_cv": instock_std / (instock_mean + 1e-8),
+            "instock_top20_share": _g_top20_share(ins),
+
+            "demand_active_rate": float((d > 0).mean()) if len(d) else 0.0,
+            "price_mean_log": float(np.log1p(g["our_price"].mean())) if "our_price" in g.columns else 0.0,
+            "promo_rate": float(g["ind_promotion"].mean()) if "ind_promotion" in g.columns else 0.0,
+            "oos_rate": float(g["scot_oos"].mean()) if "scot_oos" in g.columns else 0.0,
+        }
+        rows.append(row)
+
+    asin_feat = pd.DataFrame(rows)
+    if len(asin_feat) <= 1:
+        for c in BUYBOX_NEIGHBOR_GRAPH_COLS:
+            out[c] = 0.0
+        return out, BUYBOX_NEIGHBOR_GRAPH_COLS, {"cutoff_week": cutoff_week, "asin_feature_table": asin_feat}
+
+    # Numeric space used for KNN. log transforms keep scale stable.
+    knn_cols = [
+        # buy-box is the main similarity driver
+        "bb_mean_log", "bb_q90_log", "bb_q95_log", "bb_zero_rate", "bb_active_rate",
+        "bb_cv", "bb_top20_share", "bb_active_to_zero_rate", "bb_zero_to_active_rate",
+
+        # total / in-stock help avoid neighbors that share buy-box level but differ in exposure availability
+        "total_mean_log", "total_q90_log", "total_q95_log", "total_zero_rate", "total_active_rate",
+        "total_cv", "total_top20_share",
+        "instock_mean_log", "instock_q90_log", "instock_q95_log", "instock_zero_rate", "instock_active_rate",
+        "instock_cv", "instock_top20_share",
+
+        "demand_active_rate", "price_mean_log", "promo_rate", "oos_rate",
+    ]
+    asin_feat["bb_mean_log"] = np.log1p(asin_feat["bb_mean"])
+    asin_feat["bb_q90_log"] = np.log1p(asin_feat["bb_q90"])
+    asin_feat["bb_q95_log"] = np.log1p(asin_feat["bb_q95"])
+    asin_feat["total_mean_log"] = np.log1p(asin_feat["total_mean"])
+    asin_feat["total_q90_log"] = np.log1p(asin_feat["total_q90"])
+    asin_feat["total_q95_log"] = np.log1p(asin_feat["total_q95"])
+    asin_feat["instock_mean_log"] = np.log1p(asin_feat["instock_mean"])
+    asin_feat["instock_q90_log"] = np.log1p(asin_feat["instock_q90"])
+    asin_feat["instock_q95_log"] = np.log1p(asin_feat["instock_q95"])
+    asin_feat[knn_cols] = asin_feat[knn_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    X = asin_feat[knn_cols].values.astype(float)
+    mu = X.mean(axis=0, keepdims=True)
+    sd = X.std(axis=0, keepdims=True) + 1e-8
+    Xz = (X - mu) / sd
+
+    asins = asin_feat["asin"].values
+    gl_vals = asin_feat[gl_col].astype(str).values
+    cat_vals = asin_feat[cat_col].astype(str).values
+    n = len(asin_feat)
+    k = int(max(1, min(graph_k, n - 1)))
+
+    neighbor_records = []
+    for i in range(n):
+        same_cat_idx = np.where(cat_vals == cat_vals[i])[0]
+        same_cat_idx = same_cat_idx[same_cat_idx != i]
+        same_gl_idx = np.where(gl_vals == gl_vals[i])[0]
+        same_gl_idx = same_gl_idx[same_gl_idx != i]
+        global_idx = np.arange(n)
+        global_idx = global_idx[global_idx != i]
+
+        if len(same_cat_idx) >= min_same_category_pool:
+            cand = same_cat_idx
+            pool_type = "category"
+        elif len(same_gl_idx) >= k:
+            cand = same_gl_idx
+            pool_type = "gl"
+        else:
+            cand = global_idx
+            pool_type = "global"
+
+        if len(cand) == 0:
+            neigh = np.array([], dtype=int)
+        else:
+            dist = ((Xz[cand] - Xz[i]) ** 2).sum(axis=1)
+            take = min(k, len(cand))
+            neigh = cand[np.argpartition(dist, take - 1)[:take]] if take < len(cand) else cand
+            # sort selected neighbors for determinism
+            neigh = neigh[np.argsort(((Xz[neigh] - Xz[i]) ** 2).sum(axis=1))]
+
+        nf = asin_feat.iloc[neigh] if len(neigh) else asin_feat.iloc[[]]
+        rec = {
+            "asin": asins[i],
+            "graph_bb_neighbor_mean_log": float(np.log1p(nf["bb_mean"].mean())) if len(nf) else 0.0,
+            "graph_bb_neighbor_q90_log": float(np.log1p(nf["bb_q90"].mean())) if len(nf) else 0.0,
+            "graph_bb_neighbor_q95_log": float(np.log1p(nf["bb_q95"].mean())) if len(nf) else 0.0,
+            "graph_bb_neighbor_zero_rate": float(nf["bb_zero_rate"].mean()) if len(nf) else 0.0,
+            "graph_bb_neighbor_active_rate": float(nf["bb_active_rate"].mean()) if len(nf) else 0.0,
+            "graph_bb_neighbor_cv": float(nf["bb_cv"].mean()) if len(nf) else 0.0,
+            "graph_bb_neighbor_top20_share": float(nf["bb_top20_share"].mean()) if len(nf) else 0.0,
+            "graph_bb_neighbor_active_to_zero_rate": float(nf["bb_active_to_zero_rate"].mean()) if len(nf) else 0.0,
+            "graph_bb_neighbor_zero_to_active_rate": float(nf["bb_zero_to_active_rate"].mean()) if len(nf) else 0.0,
+
+            "graph_total_neighbor_mean_log": float(np.log1p(nf["total_mean"].mean())) if len(nf) else 0.0,
+            "graph_total_neighbor_q90_log": float(np.log1p(nf["total_q90"].mean())) if len(nf) else 0.0,
+            "graph_total_neighbor_q95_log": float(np.log1p(nf["total_q95"].mean())) if len(nf) else 0.0,
+            "graph_total_neighbor_zero_rate": float(nf["total_zero_rate"].mean()) if len(nf) else 0.0,
+            "graph_total_neighbor_active_rate": float(nf["total_active_rate"].mean()) if len(nf) else 0.0,
+            "graph_total_neighbor_cv": float(nf["total_cv"].mean()) if len(nf) else 0.0,
+            "graph_total_neighbor_top20_share": float(nf["total_top20_share"].mean()) if len(nf) else 0.0,
+
+            "graph_instock_neighbor_mean_log": float(np.log1p(nf["instock_mean"].mean())) if len(nf) else 0.0,
+            "graph_instock_neighbor_q90_log": float(np.log1p(nf["instock_q90"].mean())) if len(nf) else 0.0,
+            "graph_instock_neighbor_q95_log": float(np.log1p(nf["instock_q95"].mean())) if len(nf) else 0.0,
+            "graph_instock_neighbor_zero_rate": float(nf["instock_zero_rate"].mean()) if len(nf) else 0.0,
+            "graph_instock_neighbor_active_rate": float(nf["instock_active_rate"].mean()) if len(nf) else 0.0,
+            "graph_instock_neighbor_cv": float(nf["instock_cv"].mean()) if len(nf) else 0.0,
+            "graph_instock_neighbor_top20_share": float(nf["instock_top20_share"].mean()) if len(nf) else 0.0,
+
+            "graph_demand_neighbor_active_rate": float(nf["demand_active_rate"].mean()) if len(nf) else 0.0,
+            "graph_neighbor_count": float(len(nf)),
+            "graph_same_category_rate": float((nf[cat_col].astype(str).values == cat_vals[i]).mean()) if len(nf) else 0.0,
+            "graph_same_gl_rate": float((nf[gl_col].astype(str).values == gl_vals[i]).mean()) if len(nf) else 0.0,
+            "graph_pool_type": pool_type,
+        }
+        neighbor_records.append(rec)
+
+    graph_tbl = pd.DataFrame(neighbor_records)
+    out = out.merge(graph_tbl[["asin"] + BUYBOX_NEIGHBOR_GRAPH_COLS], on="asin", how="left")
+    for c in BUYBOX_NEIGHBOR_GRAPH_COLS:
+        out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+
+    tables = {
+        "cutoff_week": cutoff_week,
+        "asin_feature_table": asin_feat,
+        "neighbor_table": graph_tbl,
+        "graph_k": k,
+        "graph_cols": list(BUYBOX_NEIGHBOR_GRAPH_COLS),
+    }
+    return out, list(BUYBOX_NEIGHBOR_GRAPH_COLS), tables
+
+
+def print_graph_feature_summary(df, feature_cols):
+    print("\n" + "=" * 90)
+    print("MULTI-CHANNEL EXPOSURE NEIGHBOR GRAPH FEATURES")
+    print("=" * 90)
+    print("features:", feature_cols)
+    keep = [c for c in feature_cols if c in df.columns]
+    if keep:
+        print(df[keep].describe(percentiles=[0.1, 0.5, 0.9]).round(4).to_string())
+
+
 def load_exposure_data(data_raw, dph_cap_q=0.995):
     df = data_raw.copy()
     df["asin"] = df["asin"].astype(str)
@@ -585,6 +890,11 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
     for c in group_seasonality_cols:
         df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
+    # Graph version: buy-box neighbor aggregate features, if already attached.
+    buybox_graph_cols = [c for c in BUYBOX_NEIGHBOR_GRAPH_COLS if c in df.columns]
+    for c in buybox_graph_cols:
+        df[c] = _safe_numeric(df[c]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     df, explicit_event_cols = add_explicit_event_features(df, week_col="order_week")
     df, static_cols = _encode_static_features(df)
 
@@ -602,6 +912,7 @@ def load_exposure_data(data_raw, dph_cap_q=0.995):
         + ["order_month", "month_sin", "month_cos",
            "season_winter", "season_spring", "season_summer", "season_fall"]
         + group_seasonality_cols
+        + buybox_graph_cols
         # ── 商品特征（进mag_head）────────────────────────────
         + ["our_price_log_norm", "log_review_count"]
         + static_cols
@@ -2790,9 +3101,11 @@ def run_exposure_v2(
     use_encoder_self_attn=True,
     use_group_seasonality=True,
     min_cat_asins=30,
+    use_buybox_neighbor_graph=True,
+    graph_k=10,
 ):
     print("\n" + "=" * 100)
-    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + SCOT OPTION + GROUP SEASONALITY")
+    print("EXPOSURE MODEL V2: SINGLE-HEAD DIRECT + GROUP SEASONALITY + BUYBOX GRAPH + BUYBOX NEIGHBOR GRAPH")
     print("=" * 100)
 
     if use_scot_intersection:
@@ -2814,6 +3127,17 @@ def run_exposure_v2(
             min_cat_asins=min_cat_asins,
         )
         print_D_feature_summary(df, group_seasonality_cols)
+
+    # Graph version: KNN neighbor aggregate features around buy_box behavior.
+    buybox_graph_cols = []
+    buybox_graph_tables = None
+    if use_buybox_neighbor_graph:
+        df, buybox_graph_cols, buybox_graph_tables = add_buybox_neighbor_graph_features(
+            df,
+            horizon=horizon,
+            graph_k=graph_k,
+        )
+        print_graph_feature_summary(df, buybox_graph_cols)
 
     data, context_dim, context_cols = load_exposure_data(df, dph_cap_q=dph_cap_q)
 
@@ -2869,6 +3193,10 @@ def run_exposure_v2(
         "source_df": df,
         "group_seasonality_cols": group_seasonality_cols,
         "group_seasonality_tables": group_seasonality_tables,
+        "buybox_graph_cols": buybox_graph_cols,
+        "buybox_graph_tables": buybox_graph_tables,
+        "use_buybox_neighbor_graph": use_buybox_neighbor_graph,
+        "graph_k": graph_k,
         "gl_compact_buybox": gl_compact,
         "category_compact_buybox": cat_compact,
         # Backward-compatible keys kept intentionally empty.
@@ -3258,6 +3586,8 @@ def run_exposure_v2_final_scot_5000(
     use_encoder_self_attn=True,
     use_group_seasonality=True,
     min_cat_asins=30,
+    use_buybox_neighbor_graph=True,
+    graph_k=10,
 ):
     """
     Final single-window setup:
@@ -3282,6 +3612,8 @@ def run_exposure_v2_final_scot_5000(
         use_encoder_self_attn=use_encoder_self_attn,
         use_group_seasonality=use_group_seasonality,
         min_cat_asins=min_cat_asins,
+        use_buybox_neighbor_graph=use_buybox_neighbor_graph,
+        graph_k=graph_k,
     )
 
 # ============================================================
