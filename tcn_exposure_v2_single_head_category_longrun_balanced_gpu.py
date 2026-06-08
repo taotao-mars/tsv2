@@ -364,7 +364,6 @@ D_GROUP_SEASONALITY_COLS = [
     "is_holiday_q4",
     "is_summer",
     "is_spring",
-    "is_back_to_school",
 ]
 
 
@@ -416,7 +415,6 @@ def add_group_category_month_seasonality_priors(
     out["is_holiday_q4"] = out["order_month"].isin([11, 12]).astype(float)
     out["is_summer"] = out["order_month"].isin([6, 7, 8]).astype(float)
     out["is_spring"] = out["order_month"].isin([3, 4, 5]).astype(float)
-    out["is_back_to_school"] = out["order_month"].isin([8, 9]).astype(float)
 
     if cutoff_week is None:
         cutoff_week = _infer_final_holdout_cutoff_week(out, horizon=horizon, week_col=week_col)
