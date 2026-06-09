@@ -1479,34 +1479,53 @@ class TCNDecoderWithCrossAttn(nn.Module):
         return torch.cat([mean, last, maxv, slope], dim=-1)  # [B, 12]
 
     def _apply_block_ar_refinement(self, raw_log_mag, z_out, z_rep):
-        # raw_log_mag: [B,H,3]. Returns refined raw_log_mag.
+        """
+        Block semi-AR refinement without any in-place tensor writes.
+
+        Why no in-place:
+            raw_log_mag and refined blocks are needed by autograd. Slice assignment like
+            refined[:, m0:m1, :] = ... can trigger:
+            "one of the variables needed for gradient computation has been modified
+             by an inplace operation".
+
+        This version builds short/mid/long blocks and torch.cat's them back.
+        """
         H = raw_log_mag.shape[1]
         if (not self.use_block_ar) or H < 8:
             return raw_log_mag
-
-        refined = raw_log_mag.clone()
 
         # Block boundaries match diagnostics: short 1-5, mid 6-12, long 13-20.
         s0, s1 = 0, min(5, H)
         m0, m1 = s1, min(12, H)
         l0, l1 = m1, H
 
-        base_log = F.softplus(refined)
-        short_sum = self._block_summary(base_log[:, s0:s1, :])
+        # Short block stays direct.
+        short_block = raw_log_mag[:, s0:s1, :]
+        short_sum = self._block_summary(F.softplus(short_block))
 
+        blocks = [short_block]
+
+        # Mid block refined using short summary.
         if m1 > m0:
+            mid_base = raw_log_mag[:, m0:m1, :]
             mid_sum_rep = short_sum[:, None, :].expand(-1, m1 - m0, -1)
             parts = [z_out[:, m0:m1, :]]
             if z_rep is not None:
                 parts.append(z_rep[:, m0:m1, :])
             parts.append(mid_sum_rep)
             mid_delta = self.block_mid_head(torch.cat(parts, dim=-1)) * self.block_ar_scale
-            refined[:, m0:m1, :] = refined[:, m0:m1, :] + mid_delta
+            mid_block = mid_base + mid_delta
+            blocks.append(mid_block)
+        else:
+            mid_block = None
 
+        # Long block refined using short + refined-mid summary.
         if l1 > l0:
-            # Use corrected mid block summary when available.
-            corrected_log = F.softplus(refined)
-            mid_sum = self._block_summary(corrected_log[:, m0:m1, :]) if m1 > m0 else torch.zeros_like(short_sum)
+            long_base = raw_log_mag[:, l0:l1, :]
+            if mid_block is not None and mid_block.shape[1] > 0:
+                mid_sum = self._block_summary(F.softplus(mid_block))
+            else:
+                mid_sum = torch.zeros_like(short_sum)
             long_sum = torch.cat([short_sum, mid_sum], dim=-1)
             long_sum_rep = long_sum[:, None, :].expand(-1, l1 - l0, -1)
             parts = [z_out[:, l0:l1, :]]
@@ -1514,9 +1533,10 @@ class TCNDecoderWithCrossAttn(nn.Module):
                 parts.append(z_rep[:, l0:l1, :])
             parts.append(long_sum_rep)
             long_delta = self.block_long_head(torch.cat(parts, dim=-1)) * self.block_ar_scale
-            refined[:, l0:l1, :] = refined[:, l0:l1, :] + long_delta
+            long_block = long_base + long_delta
+            blocks.append(long_block)
 
-        return refined
+        return torch.cat(blocks, dim=1)
 
     def forward(self, enc_out, future_context, return_aux=False, z=None):
         B, H, _ = future_context.shape
