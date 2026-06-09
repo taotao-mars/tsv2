@@ -2996,39 +2996,6 @@ def run_exposure_v2(
     }
 
 
-# ============================================================
-# 使用
-# ============================================================
-#
-# result = run_exposure_v2(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     seed=42,
-#     history=13,
-#     horizon=20,
-#     d_model=64,
-#     n_heads=4,
-#     batch_size=64,
-#     epochs=60,
-#     lr=1e-3,
-#     patience=8,
-#     anchor_decay=0.08,     # anchor衰减速度，越大远期越快收缩到mean13
-#     bce_weight=1.00,       # occurrence BCE loss权重
-#     mag_weight=1.00,       # magnitude Huber loss权重
-#     mean_weight=0.50,      # mean scale penalty权重
-# )
-#
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# pred_df = result["forecast_df"]
-#
-# # 诊断occurrence预测质量
-# print(pred_df.groupby("horizon")["p_active_instock"].mean())
-
-# ============================================================
-# Rolling Backtest + SCOT Intersection Add-on
-# Added after original definitions; these functions override/use the fixed ABC model above.
-# ============================================================
 
 def prepare_data_from_sample_scot_intersection(
     data_raw1,
@@ -3932,60 +3899,6 @@ def run_exposure_v2_final_scot_5000(
     )
 
 # ============================================================
-# Usage
-# ============================================================
-# Final setup: 5000 sample + SCOT intersection + latest 20-week holdout.
-# Training samples are sliding windows; validation/test is the final 20-week window.
-#
-# %run -i tcn_exposure_v2_single_head_direct_gl_diag.py
-#
-# result = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=True,
-# )
-#
-# pred_df = result["forecast_df"]
-# exposure_hat_for_demand = result["exposure_hat_for_demand"]
-# diagnostics = result["diagnostics"]
-# gl_diag = result["gl_diagnostics"]
-# gl_block_diag = result["gl_horizon_block_diagnostics"]
-# gl_summary = result["gl_summary"]
-#
-# Optional no-attention ablation:
-# result_no_attn = run_exposure_v2_final_scot_5000(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     history=13,
-#     horizon=20,
-#     epochs=30,
-#     patience=6,
-#     batch_size=128,
-#     use_encoder_self_attn=False,
-# )
-#
-# Rolling backtest is still available for robustness checks:
-# result_roll = run_exposure_v2_rolling(
-#     data_raw1=data_raw1,
-#     scot_df=scot_df,
-#     n_asins=5000,
-#     history=13,
-#     horizon=20,
-#     rolling_offsets=(60, 40, 20, 0),
-#     epochs=20,
-#     patience=5,
-#     batch_size=128,
-#     use_scot_intersection=True,
-#     use_encoder_self_attn=True,
-# )
-
-
-# ============================================================
 # COMPACT DIAGNOSTICS OVERRIDE FOR D VERSION
 # Keep output short: overall metrics + buybox/instock horizon + compact group spread.
 # ============================================================
@@ -4126,4 +4039,47 @@ def compact_group_bias_check(pred_df, source_df, group_col="gl_product_group", t
         "median_WAPE": out["WAPE"].median(),
     }]).round(4).to_string(index=False))
     return out
+
+# ============================================================
+# CURRENT USAGE: GRAPH K=10 + D SEASONALITY + BLOCK-AR
+# ============================================================
+# %run -i tcn_exposure_v2_D_group_seasonality_neighbor_graph_k10_multichannel_no_bts_blockAR_gpu_FIXED_CLEAN.py
+#
+# result_graph_blockar = run_exposure_v2_final_scot_5000(
+#     data_raw1=data_raw1,
+#     scot_df=scot_df,
+#     history=13,
+#     horizon=20,
+#     epochs=30,
+#     patience=6,
+#     batch_size=128,
+#     use_encoder_self_attn=True,
+#
+#     use_group_seasonality=True,
+#     min_cat_asins=30,
+#
+#     use_buybox_neighbor_graph=True,
+#     graph_k=10,
+#
+#     use_block_ar=True,
+#     block_ar_scale=0.35,
+# )
+#
+# pred_df = result_graph_blockar["forecast_df"]
+# exposure_hat_for_demand = result_graph_blockar["exposure_hat_for_demand"]
+#
+# # Optional save:
+# # pred_df.to_csv("exposure_graph_blockar_pred_df.csv", index=False)
+# # exposure_hat_for_demand.to_csv("exposure_hat_for_demand_graph_blockar.csv", index=False)
+#
+# # Demand connection:
+# # demand_result_buybox_blockar = run_demand_with_predicted_exposure_buybox_only(
+# #     data_raw1=data_raw1,
+# #     scot_df=scot_df,
+# #     exposure_result_or_hat=exposure_hat_for_demand,
+# #     n_asins=5000,
+# #     epochs=60,
+# #     history=52,
+# #     horizon=20,
+# # )
 
